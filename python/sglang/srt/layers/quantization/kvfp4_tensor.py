@@ -149,6 +149,12 @@ class BlockFP4KVQuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
+# The MHA KV memory-pool path imports the historical KVFP4 name. Keep this
+# alias so fp4_e2m1 pool code and the quantization-method wrapper agree on the
+# same block-wise E2M1 implementation.
+KVFP4QuantizeUtil = BlockFP4KVQuantizeUtil
+
+
 class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).
