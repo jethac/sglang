@@ -679,8 +679,8 @@ class TestKV4Compatibility(unittest.TestCase):
         args = ServerArgs(model_path="dummy")
         args.kv_cache_dtype = "fp4_e2m1"
         args.attention_backend = attention_backend
-        args.prefill_attention_backend_str = prefill_attention_backend
-        args.decode_attention_backend_str = decode_attention_backend
+        args.prefill_attention_backend = prefill_attention_backend
+        args.decode_attention_backend = decode_attention_backend
         return args
 
     @patch.object(ServerArgs, "use_mla_backend", return_value=False)
