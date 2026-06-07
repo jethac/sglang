@@ -3100,6 +3100,8 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                         ]
+                        if is_sm120_supported():
+                            KV4_FA4_MHA_BACKEND_CHOICES.append("flashinfer")
                         assert (
                             self.decode_attention_backend_str
                             in KV4_FA4_MHA_BACKEND_CHOICES
@@ -3128,6 +3130,8 @@ class ServerArgs:
                             "flex_attention",
                             "trtllm_mha",
                         ]
+                        if is_sm120_supported():
+                            KV4_ATTENTION_MHA_BACKEND_CHOICES.append("flashinfer")
                         assert (
                             self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
                         ), (
