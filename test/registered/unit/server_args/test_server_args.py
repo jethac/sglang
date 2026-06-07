@@ -528,6 +528,18 @@ class TestKV4Compatibility(unittest.TestCase):
         args._handle_kv4_compatibility()
 
 
+class TestKV4QuantizeAlias(unittest.TestCase):
+    def test_historical_kvfp4_alias_uses_block_util(self):
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            BlockFP4KVQuantizeUtil,
+            KVFP4QuantizeUtil,
+        )
+
+        self.assertIs(KVFP4QuantizeUtil, BlockFP4KVQuantizeUtil)
+        self.assertTrue(hasattr(KVFP4QuantizeUtil, "batched_quantize"))
+        self.assertTrue(hasattr(KVFP4QuantizeUtil, "batched_dequantize"))
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(
