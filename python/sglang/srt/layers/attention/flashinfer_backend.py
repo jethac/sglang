@@ -48,6 +48,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _fp4_kv_radix_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_RADIX") == "1"
+
+
+def _trace_cpu_values(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu").tolist()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    try:
+        return list(value)
+    except TypeError:
+        return value
+
+
+def _trace_rids(forward_batch: ForwardBatch):
+    rids = getattr(forward_batch, "rids", None)
+    if rids is None:
+        return None
+    return [str(rid) for rid in rids]
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -396,6 +421,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         self._nvfp4_trace_seen = set()
+        self._nvfp4_batch_trace_seen = set()
 
     def _trace_nvfp4_native_call(
         self,
@@ -434,6 +460,53 @@ class FlashInferAttnBackend(AttentionBackend):
             _tensor_trace_summary(v_sf),
             _scale_trace_value(paged_kv_kwargs.get("k_scale")),
             _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+        )
+
+    def _trace_nvfp4_forward_batch(
+        self,
+        *,
+        label: str,
+        forward_batch: ForwardBatch,
+        use_ragged: Optional[bool],
+        extend_no_prefix: Optional[bool],
+    ):
+        if not self.is_nvfp4_native or not _fp4_kv_radix_trace_enabled():
+            return
+
+        rids = _trace_rids(forward_batch)
+        rid_filter = os.environ.get("SGLANG_FP4_KV_TRACE_RID")
+        if rid_filter not in (None, "") and (rids is None or rid_filter not in rids):
+            return
+
+        extend_prefix_lens_cpu = _trace_cpu_values(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        )
+        seq_lens_cpu = _trace_cpu_values(getattr(forward_batch, "seq_lens_cpu", None))
+        key = (
+            label,
+            tuple(rids or ()),
+            tuple(extend_prefix_lens_cpu or ()),
+            tuple(seq_lens_cpu or ()),
+            bool(use_ragged),
+            bool(extend_no_prefix),
+        )
+        if key in self._nvfp4_batch_trace_seen:
+            return
+        self._nvfp4_batch_trace_seen.add(key)
+
+        logger.warning(
+            "FP4 KV FlashInfer batch trace label=%s rids=%s mode=%s "
+            "seq_lens_cpu=%s extend_prefix_lens_cpu=%s use_ragged=%s "
+            "extend_no_prefix=%s req_pool_indices=%s out_cache_loc=%s",
+            label,
+            rids,
+            getattr(forward_batch, "forward_mode", None),
+            seq_lens_cpu,
+            extend_prefix_lens_cpu,
+            use_ragged,
+            extend_no_prefix,
+            _tensor_trace_summary(getattr(forward_batch, "req_pool_indices", None)),
+            _tensor_trace_summary(getattr(forward_batch, "out_cache_loc", None)),
         )
 
     def _get_paged_kv_cache_and_kwargs(self, layer: RadixAttention):
@@ -768,6 +841,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
             )
+            self._trace_nvfp4_forward_batch(
+                label="init_forward_metadata_extend",
+                forward_batch=forward_batch,
+                use_ragged=use_ragged,
+                extend_no_prefix=extend_no_prefix,
+            )
 
     def init_cuda_graph_state(
         self,
@@ -927,6 +1006,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 else -1
             )
             if self.is_nvfp4_native:
+                self._trace_nvfp4_forward_batch(
+                    label="forward_extend_paged",
+                    forward_batch=forward_batch,
+                    use_ragged=self.forward_metadata.use_ragged,
+                    extend_no_prefix=self.forward_metadata.extend_no_prefix,
+                )
                 q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 self._trace_nvfp4_native_call(
                     label="extend_paged",
@@ -979,6 +1064,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
+                self._trace_nvfp4_forward_batch(
+                    label="forward_extend_ragged_no_prefix",
+                    forward_batch=forward_batch,
+                    use_ragged=self.forward_metadata.use_ragged,
+                    extend_no_prefix=self.forward_metadata.extend_no_prefix,
+                )
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
@@ -1013,6 +1104,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer
                 )
                 if self.is_nvfp4_native:
+                    self._trace_nvfp4_forward_batch(
+                        label="forward_extend_merge_paged",
+                        forward_batch=forward_batch,
+                        use_ragged=self.forward_metadata.use_ragged,
+                        extend_no_prefix=self.forward_metadata.extend_no_prefix,
+                    )
                     q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                     self._trace_nvfp4_native_call(
                         label="extend_merge_paged",
