@@ -84,6 +84,81 @@ _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
+def _fp4_kv_trace_write_read_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_WRITE_READ") == "1"
+
+
+def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
+    if raw in (None, ""):
+        return True
+    enabled = {item.strip() for item in raw.split(",") if item.strip()}
+    return str(layer_id) in enabled
+
+
+def _fp4_kv_trace_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _fp4_kv_trace_tensor_summary(x: torch.Tensor):
+    return {
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "stride": tuple(x.stride()),
+        "device": str(x.device),
+        "storage_offset": x.storage_offset(),
+    }
+
+
+def _fp4_kv_trace_raw_bytes(x: torch.Tensor, limit: int):
+    try:
+        byte_view = x.detach().contiguous().view(torch.uint8).flatten()
+        summary = _fp4_kv_trace_tensor_summary(x)
+        summary["bytes"] = byte_view[:limit].to("cpu").tolist()
+        return summary
+    except Exception as exc:
+        summary = _fp4_kv_trace_tensor_summary(x)
+        summary["bytes_error"] = repr(exc)
+        return summary
+
+
+def _fp4_kv_trace_sample_loc_pairs(loc: torch.Tensor):
+    limit = _fp4_kv_trace_int_env("SGLANG_FP4_KV_TRACE_LOC_LIMIT", 128)
+    values = loc.detach().flatten().to("cpu").tolist()
+    if limit == 0:
+        return []
+    if len(values) <= limit:
+        selected = list(enumerate(values))
+    else:
+        head_count = max(1, limit // 2)
+        tail_count = max(0, limit - head_count)
+        selected = list(enumerate(values[:head_count]))
+        if tail_count > 0:
+            selected.extend(
+                (len(values) - tail_count + idx, value)
+                for idx, value in enumerate(values[-tail_count:])
+            )
+
+    pairs = []
+    seen_pages = set()
+    for source_index, page in selected:
+        try:
+            page_int = int(page)
+        except (TypeError, ValueError):
+            continue
+        if page_int in seen_pages:
+            continue
+        seen_pages.add(page_int)
+        pairs.append((int(source_index), page_int))
+    return pairs
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -1390,6 +1465,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 self.v_global_float = [1.0 for _ in range(self.layer_num)]
                 self._gs_calibrated = [False for _ in range(self.layer_num)]
                 self._autocalib_warned = False
+                self._fp4_kv_write_trace_by_layer_loc = {}
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -1443,6 +1519,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_global_float
         del self.v_global_float
         del self._gs_calibrated
+        del self._fp4_kv_write_trace_by_layer_loc
 
     def _get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
@@ -1588,6 +1665,105 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_size_bytes += get_tensor_size_bytes(self.v_global)
         return k_size_bytes, v_size_bytes
 
+    def _trace_fp4_kv_write(
+        self,
+        *,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_k_fp4_sf: torch.Tensor,
+        cache_v_fp4_sf: torch.Tensor,
+    ):
+        if not _fp4_kv_trace_write_read_enabled() or not _fp4_kv_trace_layer_enabled(
+            layer_id
+        ):
+            return
+
+        local_layer_id = layer_id - self.start_layer
+        byte_limit = _fp4_kv_trace_int_env("SGLANG_FP4_KV_TRACE_VALUES", 16)
+        pairs = _fp4_kv_trace_sample_loc_pairs(loc)
+        layer_trace = self._fp4_kv_write_trace_by_layer_loc.setdefault(
+            local_layer_id, {}
+        )
+        samples = []
+        for source_index, page in pairs:
+            if source_index >= cache_k.shape[0]:
+                continue
+            write_summary = {
+                "layer": int(layer_id),
+                "local_layer": int(local_layer_id),
+                "source_index": int(source_index),
+                "page": int(page),
+                "k_scale": float(self.k_global_float[local_layer_id]),
+                "v_scale": float(self.v_global_float[local_layer_id]),
+                "input_bytes": {
+                    "k_cache": _fp4_kv_trace_raw_bytes(
+                        cache_k[source_index], byte_limit
+                    ),
+                    "v_cache": _fp4_kv_trace_raw_bytes(
+                        cache_v[source_index], byte_limit
+                    ),
+                    "k_sf": _fp4_kv_trace_raw_bytes(
+                        cache_k_fp4_sf[source_index], byte_limit
+                    ),
+                    "v_sf": _fp4_kv_trace_raw_bytes(
+                        cache_v_fp4_sf[source_index], byte_limit
+                    ),
+                },
+                "stored_bytes": {
+                    "k_cache": _fp4_kv_trace_raw_bytes(
+                        self.k_buffer[local_layer_id][page], byte_limit
+                    ),
+                    "v_cache": _fp4_kv_trace_raw_bytes(
+                        self.v_buffer[local_layer_id][page], byte_limit
+                    ),
+                    "k_sf": _fp4_kv_trace_raw_bytes(
+                        self.k_scale_buffer[local_layer_id][page], byte_limit
+                    ),
+                    "v_sf": _fp4_kv_trace_raw_bytes(
+                        self.v_scale_buffer[local_layer_id][page], byte_limit
+                    ),
+                },
+            }
+            layer_trace[int(page)] = write_summary
+            samples.append(write_summary)
+
+        if samples:
+            logger.warning(
+                "FP4 KV write trace %s",
+                {
+                    "layer": int(layer_id),
+                    "local_layer": int(local_layer_id),
+                    "loc_len": int(loc.numel()),
+                    "sample_count": len(samples),
+                    "sample_pages": [sample["page"] for sample in samples],
+                    "samples": samples,
+                },
+            )
+
+    def get_fp4_kv_write_trace_samples(self, layer_id: int, page_ids):
+        local_layer_id = layer_id - self.start_layer
+        layer_trace = getattr(self, "_fp4_kv_write_trace_by_layer_loc", {}).get(
+            local_layer_id, {}
+        )
+        samples = []
+        for page in page_ids:
+            try:
+                page_int = int(page)
+            except (TypeError, ValueError):
+                samples.append({"page": repr(page), "error": "invalid page id"})
+                continue
+            samples.append(
+                {
+                    "page": page_int,
+                    "write": layer_trace.get(
+                        page_int, {"error": "missing write trace for page"}
+                    ),
+                }
+            )
+        return samples
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1641,6 +1817,15 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+
+        self._trace_fp4_kv_write(
+            layer_id=layer_id,
+            loc=loc,
+            cache_k=cache_k,
+            cache_v=cache_v,
+            cache_k_fp4_sf=cache_k_fp4_sf,
+            cache_v_fp4_sf=cache_v_fp4_sf,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if self.layer_num == 0:

@@ -405,6 +405,19 @@ def _trace_tensor_key(x):
     )
 
 
+def _trace_nvfp4_write_samples(token_to_kv_pool, layer_id: int, page_ids):
+    try:
+        kv_pool, local_layer_id = _nvfp4_inner_pool_and_layer_id(
+            token_to_kv_pool, layer_id
+        )
+        getter = getattr(kv_pool, "get_fp4_kv_write_trace_samples", None)
+        if getter is None:
+            return None
+        return getter(local_layer_id, page_ids)
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -827,6 +840,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 "k_sf": _trace_sample_page_bytes(k_sf, page_ids),
                 "v_sf": _trace_sample_page_bytes(v_sf, page_ids),
             },
+            "write_trace": _trace_nvfp4_write_samples(
+                self.token_to_kv_pool, int(layer.layer_id), page_ids
+            ),
             "k_scale": _scale_trace_value(paged_kv_kwargs.get("k_scale")),
             "v_scale": _scale_trace_value(paged_kv_kwargs.get("v_scale")),
             "merge_inputs": {
