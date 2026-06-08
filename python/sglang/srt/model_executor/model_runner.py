@@ -887,6 +887,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self._calibrate_nvfp4_kv_cache()
+            self._disable_cuda_graph_for_nvfp4_kv_if_needed()
             self.kernel_warmup()
             self._pre_initialize_flashinfer_allreduce_workspace()
             if not disable_cuda_graph:
@@ -2865,6 +2866,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except Exception:
                     pass
                 self.req_to_token_pool.free_slots.append(req_pool_idx)
+
+    def _disable_cuda_graph_for_nvfp4_kv_if_needed(self) -> None:
+        """Avoid graph-captured native FP4 KV until the FlashInfer path is graph-safe."""
+        if not self._get_nvfp4_native_kv_pools():
+            return
+        if os.environ.get("SGLANG_FP4_KV_ENABLE_CUDA_GRAPH", "0") == "1":
+            return
+
+        disabled = False
+        if not self.server_args.disable_cuda_graph:
+            self.server_args.disable_cuda_graph = True
+            disabled = True
+        if not self.server_args.disable_piecewise_cuda_graph:
+            self.server_args.disable_piecewise_cuda_graph = True
+            disabled = True
+        if disabled:
+            logger.warning(
+                "Disabling CUDA graph capture for native FP4 KV cache. "
+                "Current FlashInfer FA2 NVFP4 KV graph capture can produce "
+                "corrupt decode output; set SGLANG_FP4_KV_ENABLE_CUDA_GRAPH=1 "
+                "only for graph-safety experiments."
+            )
 
     def _dummy_run(
         self,
