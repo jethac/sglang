@@ -1063,6 +1063,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_scale = v_scale[:, 0]
             k_scale = k_scale.view(torch.float8_e4m3fn)
             v_scale = v_scale.view(torch.float8_e4m3fn)
+            k_scale_for_dequant = k_scale.reshape(k_scale.shape[0], -1)
+            v_scale_for_dequant = v_scale.reshape(v_scale.shape[0], -1)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 NVFP4KVQuantizeUtil,
@@ -1070,13 +1072,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
             k_ref = NVFP4KVQuantizeUtil.dequantize(
                 k_packed.view(torch.uint8),
-                k_scale,
+                k_scale_for_dequant,
                 paged_kv_kwargs["k_scale"],
                 dtype=torch.float32,
             ).float()
             v_ref = NVFP4KVQuantizeUtil.dequantize(
                 v_packed.view(torch.uint8),
-                v_scale,
+                v_scale_for_dequant,
                 paged_kv_kwargs["v_scale"],
                 dtype=torch.float32,
             ).float()
