@@ -779,6 +779,12 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _get_kv_buffer_for_flashinfer(self, layer_id: int):
+        fp4_getter = getattr(self.token_to_kv_pool, "get_fp4_kv_buffer", None)
+        if fp4_getter is not None:
+            return fp4_getter(layer_id)
+        return self.token_to_kv_pool.get_kv_buffer(layer_id)
+
     @debug_kernel_api
     def forward_extend(
         self,
@@ -826,7 +832,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self._get_kv_buffer_for_flashinfer(layer.layer_id),
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -898,7 +904,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    self._get_kv_buffer_for_flashinfer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     window_left=swa_window_left,
@@ -965,7 +971,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            self._get_kv_buffer_for_flashinfer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.

@@ -1488,6 +1488,17 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    def get_fp4_kv_buffer(self, layer_id: int):
+        layer_idx = layer_id - self.start_layer
+        return (
+            self.k_buffer[layer_idx].view(self.dtype),
+            self.v_buffer[layer_idx].view(self.dtype),
+        )
+
+    def get_fp4_kv_scale_buffer(self, layer_id: int):
+        layer_idx = layer_id - self.start_layer
+        return self.k_scale_buffer[layer_idx], self.v_scale_buffer[layer_idx]
+
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
