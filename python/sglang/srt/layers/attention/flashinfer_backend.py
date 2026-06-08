@@ -61,6 +61,10 @@ def _fp4_kv_merge_state_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_MERGE_STATE") == "1"
 
 
+def _fp4_kv_prefix_ref_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_PREFIX_REF") == "1"
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -75,6 +79,16 @@ def _trace_value_limit(default: int = 8) -> int:
         return default
     try:
         return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _trace_token_limit(default: int = 128) -> int:
+    raw = os.environ.get("SGLANG_FP4_KV_PREFIX_REF_MAX_TOKENS")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(raw))
     except ValueError:
         return default
 
@@ -418,6 +432,64 @@ def _trace_nvfp4_write_samples(token_to_kv_pool, layer_id: int, page_ids):
         return {"error": repr(exc)}
 
 
+def _trace_compare_tensors(a: torch.Tensor, b: torch.Tensor):
+    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+        return {
+            "a": _tensor_trace_summary(a),
+            "b": _tensor_trace_summary(b),
+            "error": "non-tensor input",
+        }
+    summary = {
+        "a": _tensor_trace_summary(a),
+        "b": _tensor_trace_summary(b),
+        "shape_match": tuple(a.shape) == tuple(b.shape),
+    }
+    if tuple(a.shape) != tuple(b.shape):
+        return summary
+    try:
+        af = a.detach().float()
+        bf = b.detach().float()
+        diff = af - bf
+        finite = torch.isfinite(af) & torch.isfinite(bf)
+        summary["finite_pair"] = bool(finite.all().detach().cpu().item())
+        if diff.numel() > 0:
+            summary["max_abs"] = float(diff.abs().max().detach().cpu().item())
+            summary["rms"] = float(
+                torch.sqrt(torch.mean(diff * diff)).detach().cpu().item()
+            )
+            summary["cosine"] = float(
+                torch.nn.functional.cosine_similarity(
+                    af.flatten(), bf.flatten(), dim=0, eps=1e-12
+                )
+                .detach()
+                .cpu()
+                .item()
+            )
+    except Exception as exc:
+        summary["compare_error"] = repr(exc)
+    return summary
+
+
+def _trace_select_lse_slice(s: torch.Tensor, qo_start: int, qo_end: int, q_len: int):
+    if not isinstance(s, torch.Tensor):
+        return None
+    if s.dim() < 2:
+        return None
+    try:
+        if s.shape[0] >= qo_end:
+            return s[qo_start:qo_end]
+        if s.shape[-1] >= qo_end:
+            moved = s.transpose(0, -1)
+            return moved[qo_start:qo_end]
+        if s.shape[0] == q_len:
+            return s
+        if s.shape[-1] == q_len:
+            return s.transpose(0, -1)
+    except Exception:
+        return None
+    return None
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -614,7 +686,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_batch_trace_seen = set()
         self._nvfp4_page_pair_trace_seen = set()
         self._nvfp4_merge_state_trace_seen = set()
+        self._nvfp4_prefix_ref_trace_seen = set()
         self._nvfp4_last_paged_plan = {}
+        self._nvfp4_last_paged_plan_tensors = {}
 
     def _trace_nvfp4_native_call(
         self,
@@ -712,11 +786,17 @@ class FlashInferAttnBackend(AttentionBackend):
         prefix_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor],
+        qo_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
         use_ragged: bool,
     ):
-        if not self.is_nvfp4_native or not _fp4_kv_page_pair_trace_enabled():
+        if not self.is_nvfp4_native:
+            return
+        if (
+            not _fp4_kv_page_pair_trace_enabled()
+            and not _fp4_kv_prefix_ref_trace_enabled()
+        ):
             return
 
         try:
@@ -724,6 +804,22 @@ class FlashInferAttnBackend(AttentionBackend):
         except Exception:
             used = 0
         kv_indices_used = kv_indices[:used]
+        tensor_plan = None
+        if _fp4_kv_prefix_ref_trace_enabled():
+            try:
+                tensor_plan = {
+                    "label": label,
+                    "wrapper_id": int(wrapper_id),
+                    "qo_indptr": qo_indptr.detach().clone(),
+                    "kv_indptr": kv_indptr.detach().clone(),
+                    "kv_indices": kv_indices_used.detach().clone(),
+                    "prefix_lens": prefix_lens.detach().clone(),
+                    "seq_lens": seq_lens.detach().clone(),
+                }
+            except Exception as exc:
+                tensor_plan = {"error": repr(exc)}
+            self._nvfp4_last_paged_plan_tensors[int(wrapper_id)] = tensor_plan
+
         plan = {
             "label": label,
             "wrapper_id": int(wrapper_id),
@@ -737,6 +833,9 @@ class FlashInferAttnBackend(AttentionBackend):
             "kv_indices_used": _trace_tensor_values(kv_indices_used),
         }
         self._nvfp4_last_paged_plan[int(wrapper_id)] = plan
+
+        if not _fp4_kv_page_pair_trace_enabled():
+            return
 
         key = (
             label,
@@ -854,6 +953,198 @@ class FlashInferAttnBackend(AttentionBackend):
             "merged": _trace_numeric_tensor_stats(merged),
         }
         logger.warning("FP4 KV merge-state trace %s", summary)
+
+    def _trace_nvfp4_prefix_reference(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        q: torch.Tensor,
+        paged_kv_cache,
+        paged_kv_kwargs,
+        o1: torch.Tensor,
+        s1: torch.Tensor,
+        o2: torch.Tensor,
+        s2: torch.Tensor,
+        merged: torch.Tensor,
+        swa_window_left: Optional[int],
+        sm_scale: float,
+        logits_soft_cap: Optional[float],
+    ):
+        if (
+            not self.is_nvfp4_native
+            or not _fp4_kv_prefix_ref_trace_enabled()
+            or not _trace_layer_enabled(int(layer.layer_id))
+        ):
+            return
+
+        wrapper_id = int(self._get_wrapper_idx(layer))
+        plan = self._nvfp4_last_paged_plan_tensors.get(wrapper_id)
+        key = (label, int(layer.layer_id), wrapper_id, _trace_tensor_key(q))
+        if key in self._nvfp4_prefix_ref_trace_seen:
+            return
+        self._nvfp4_prefix_ref_trace_seen.add(key)
+
+        summary = {
+            "label": label,
+            "layer": int(layer.layer_id),
+            "wrapper_id": wrapper_id,
+            "swa_window_left": swa_window_left,
+            "plan_error": None,
+        }
+        try:
+            if not isinstance(plan, dict) or "error" in plan:
+                summary["plan_error"] = plan
+                logger.warning("FP4 KV prefix-reference trace %s", summary)
+                return
+
+            qo_indptr = plan["qo_indptr"].to(device=q.device, dtype=torch.long)
+            kv_indptr = plan["kv_indptr"].to(device=q.device, dtype=torch.long)
+            kv_indices = plan["kv_indices"].to(device=q.device, dtype=torch.long)
+            prefix_lens = plan["prefix_lens"].to(device=q.device, dtype=torch.long)
+
+            req_idx = None
+            for idx, prefix_len in enumerate(prefix_lens.detach().cpu().tolist()):
+                if int(prefix_len) > 0:
+                    req_idx = idx
+                    break
+            if req_idx is None:
+                summary["skip"] = "no cached prefix"
+                logger.warning("FP4 KV prefix-reference trace %s", summary)
+                return
+
+            qo_start = int(qo_indptr[req_idx].detach().cpu().item())
+            qo_end = int(qo_indptr[req_idx + 1].detach().cpu().item())
+            kv_start = int(kv_indptr[req_idx].detach().cpu().item())
+            kv_end = int(kv_indptr[req_idx + 1].detach().cpu().item())
+            token_limit = _trace_token_limit()
+            kv_end = min(kv_end, kv_start + token_limit)
+            q_req = q[qo_start:qo_end].float()
+            prefix_slots = kv_indices[kv_start:kv_end]
+            summary.update(
+                {
+                    "request_index": req_idx,
+                    "qo_range": [qo_start, qo_end],
+                    "kv_range": [kv_start, kv_end],
+                    "prefix_slots": _trace_tensor_values(prefix_slots),
+                    "token_limit": token_limit,
+                }
+            )
+            if q_req.numel() == 0 or prefix_slots.numel() == 0:
+                summary["skip"] = "empty q or prefix"
+                logger.warning("FP4 KV prefix-reference trace %s", summary)
+                return
+
+            k_cache, v_cache = paged_kv_cache
+            k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+            if not all(
+                isinstance(x, torch.Tensor) for x in (k_cache, v_cache, k_sf, v_sf)
+            ):
+                summary["error"] = "missing tensor cache or scale views"
+                summary["cache"] = _tensor_trace_summary(paged_kv_cache)
+                summary["scale"] = _tensor_trace_summary((k_sf, v_sf))
+                logger.warning("FP4 KV prefix-reference trace %s", summary)
+                return
+
+            k_packed = k_cache[prefix_slots]
+            v_packed = v_cache[prefix_slots]
+            k_scale = k_sf[prefix_slots]
+            v_scale = v_sf[prefix_slots]
+            if k_scale.dim() == 4 and k_scale.shape[1] == 1:
+                k_scale = k_scale[:, 0]
+            if v_scale.dim() == 4 and v_scale.shape[1] == 1:
+                v_scale = v_scale[:, 0]
+            k_scale = k_scale.view(torch.float8_e4m3fn)
+            v_scale = v_scale.view(torch.float8_e4m3fn)
+
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                NVFP4KVQuantizeUtil,
+            )
+
+            k_ref = NVFP4KVQuantizeUtil.dequantize(
+                k_packed.view(torch.uint8),
+                k_scale,
+                paged_kv_kwargs["k_scale"],
+                dtype=torch.float32,
+            ).float()
+            v_ref = NVFP4KVQuantizeUtil.dequantize(
+                v_packed.view(torch.uint8),
+                v_scale,
+                paged_kv_kwargs["v_scale"],
+                dtype=torch.float32,
+            ).float()
+
+            q_heads = q_req.shape[1]
+            kv_heads = k_ref.shape[1]
+            if q_heads % kv_heads != 0:
+                summary["error"] = "q heads are not divisible by kv heads"
+                summary["q_heads"] = int(q_heads)
+                summary["kv_heads"] = int(kv_heads)
+                logger.warning("FP4 KV prefix-reference trace %s", summary)
+                return
+
+            kv_head_for_q = torch.arange(q_heads, device=q.device) // (
+                q_heads // kv_heads
+            )
+            k_for_q = k_ref[:, kv_head_for_q, :]
+            v_for_q = v_ref[:, kv_head_for_q, :]
+            logits = torch.einsum("qhd,thd->qht", q_req, k_for_q) * float(sm_scale)
+            if logits_soft_cap is not None and float(logits_soft_cap) > 0:
+                logits = float(logits_soft_cap) * torch.tanh(
+                    logits / float(logits_soft_cap)
+                )
+            lse_ref = torch.logsumexp(logits, dim=-1)
+            probs = torch.softmax(logits, dim=-1)
+            o2_ref = torch.einsum("qht,thd->qhd", probs, v_for_q).to(o2.dtype)
+
+            o2_slice = o2[qo_start:qo_end]
+            s2_slice = _trace_select_lse_slice(s2, qo_start, qo_end, qo_end - qo_start)
+            summary["reference"] = {
+                "q": _trace_numeric_tensor_stats(q_req),
+                "k_dequant": _trace_numeric_tensor_stats(k_ref),
+                "v_dequant": _trace_numeric_tensor_stats(v_ref),
+                "lse_ref": _trace_numeric_tensor_stats(lse_ref),
+                "o2_ref": _trace_numeric_tensor_stats(o2_ref),
+                "o2_flashinfer": _trace_numeric_tensor_stats(o2_slice),
+                "o2_compare": _trace_compare_tensors(o2_ref, o2_slice),
+            }
+            if isinstance(s2_slice, torch.Tensor):
+                summary["reference"]["s2_flashinfer"] = _trace_numeric_tensor_stats(
+                    s2_slice
+                )
+                summary["reference"]["s2_compare"] = _trace_compare_tensors(
+                    lse_ref, s2_slice
+                )
+            else:
+                summary["reference"]["s2_compare"] = {
+                    "error": "could not select comparable s2 slice",
+                    "s2": _tensor_trace_summary(s2),
+                }
+
+            s1_slice = _trace_select_lse_slice(s1, qo_start, qo_end, qo_end - qo_start)
+            merged_slice = merged[qo_start:qo_end]
+            if isinstance(s1_slice, torch.Tensor) and isinstance(s2_slice, torch.Tensor):
+                o1_slice = o1[qo_start:qo_end].float()
+                o2_slice_f = o2_slice.float()
+                s1_work = s1_slice.float().unsqueeze(-1)
+                s2_work = s2_slice.float().unsqueeze(-1)
+                m = torch.maximum(s1_work, s2_work)
+                w1 = torch.exp(s1_work - m)
+                w2 = torch.exp(s2_work - m)
+                manual_merged = ((o1_slice * w1) + (o2_slice_f * w2)) / (w1 + w2)
+                summary["merge_compare"] = _trace_compare_tensors(
+                    manual_merged.to(merged.dtype), merged_slice
+                )
+            else:
+                summary["merge_compare"] = {
+                    "error": "could not select comparable s1/s2 slices",
+                    "s1": _tensor_trace_summary(s1),
+                    "s2": _tensor_trace_summary(s2),
+                }
+        except Exception as exc:
+            summary["error"] = repr(exc)
+
+        logger.warning("FP4 KV prefix-reference trace %s", summary)
 
     def _get_paged_kv_cache_and_kwargs(self, layer: RadixAttention):
         kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1511,6 +1802,21 @@ class FlashInferAttnBackend(AttentionBackend):
                         s2=s2,
                         merged=o,
                         swa_window_left=swa_window_left,
+                    )
+                    self._trace_nvfp4_prefix_reference(
+                        label="extend_merge_paged",
+                        layer=layer,
+                        q=q_native,
+                        paged_kv_cache=paged_kv_cache,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                        o1=o1,
+                        s1=s1,
+                        o2=o2,
+                        s2=s2,
+                        merged=o,
+                        swa_window_left=swa_window_left,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
                     )
 
             if save_kv_cache:
@@ -2193,6 +2499,7 @@ class FlashInferIndicesUpdaterPrefill:
             prefix_lens=prefix_lens,
             seq_lens=seq_lens,
             kv_start_idx=kv_start_idx,
+            qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             use_ragged=use_ragged,
