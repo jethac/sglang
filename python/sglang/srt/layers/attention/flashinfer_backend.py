@@ -422,6 +422,18 @@ def _trace_plan_sample_pages(plan, limit: int = 4):
     return pages
 
 
+def _trace_tensor_key(x):
+    if not isinstance(x, torch.Tensor):
+        return repr(x)
+    return (
+        tuple(x.shape),
+        str(x.dtype),
+        str(x.device),
+        tuple(x.stride()),
+        x.storage_offset(),
+    )
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -851,8 +863,8 @@ class FlashInferAttnBackend(AttentionBackend):
             int(layer.layer_id),
             wrapper_id,
             tuple(page_ids),
-            _tensor_trace_summary(o1),
-            _tensor_trace_summary(o2),
+            _trace_tensor_key(o1),
+            _trace_tensor_key(o2),
         )
         if key in self._nvfp4_merge_state_trace_seen:
             return
