@@ -173,6 +173,12 @@ def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
     return inner_pool, local_layer_id
 
 
+def _shape_nvfp4_kv_scale_for_flashinfer(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dim() == 3:
+        return scale.unsqueeze(1)
+    return scale
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -378,6 +384,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.token_to_kv_pool, layer.layer_id
         )
         k_sf, v_sf = kv_pool.get_kv_scale_buffer(local_layer_id)
+        k_sf = _shape_nvfp4_kv_scale_for_flashinfer(k_sf)
+        v_sf = _shape_nvfp4_kv_scale_for_flashinfer(v_sf)
         k_global, v_global = kv_pool.get_kv_global_scale(local_layer_id)
         return kv_cache, {
             "kv_cache_sf": (k_sf, v_sf),
@@ -1264,8 +1272,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_kv_heads,
                 self.head_dim,
                 1,
-                data_type=self.data_type,
-                kv_data_type=self.kv_data_type,
+                data_type=self.kv_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -1284,8 +1291,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_kv_heads,
                 self.head_dim,
                 1,
-                data_type=self.data_type,
-                kv_data_type=self.kv_data_type,
+                data_type=self.kv_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
