@@ -209,6 +209,30 @@ def _shape_nvfp4_kv_scale_for_flashinfer(scale: torch.Tensor) -> torch.Tensor:
     return scale
 
 
+def _tensor_trace_summary(x):
+    if isinstance(x, torch.Tensor):
+        return {
+            "shape": tuple(x.shape),
+            "dtype": str(x.dtype),
+            "stride": tuple(x.stride()),
+            "device": str(x.device),
+        }
+    if isinstance(x, (tuple, list)):
+        return tuple(_tensor_trace_summary(item) for item in x)
+    return repr(x)
+
+
+def _scale_trace_value(x):
+    try:
+        if isinstance(x, torch.Tensor):
+            if x.numel() == 1:
+                return float(x.detach().float().cpu().item())
+            return _tensor_trace_summary(x)
+        return float(x)
+    except Exception:
+        return repr(x)
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -409,6 +433,46 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self._nvfp4_trace_seen = set()
+
+    def _trace_nvfp4_native_call(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        q: torch.Tensor,
+        paged_kv_cache,
+        paged_kv_kwargs,
+    ):
+        if not self.is_nvfp4_native or os.environ.get("SGLANG_FP4_KV_TRACE_BACKEND") != "1":
+            return
+        key = (label, int(layer.layer_id))
+        if key in self._nvfp4_trace_seen:
+            return
+        self._nvfp4_trace_seen.add(key)
+
+        metadata = self.forward_metadata
+        metadata_summary = {
+            "type": type(metadata).__name__ if metadata is not None else None,
+            "use_ragged": getattr(metadata, "use_ragged", None),
+            "extend_no_prefix": getattr(metadata, "extend_no_prefix", None),
+        }
+        k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+        logger.warning(
+            "NVFP4 KV backend trace label=%s layer=%s wrapper_idx=%s "
+            "metadata=%s q=%s kv_cache=%s k_sf=%s v_sf=%s "
+            "k_scale=%s v_scale=%s",
+            label,
+            layer.layer_id,
+            self._get_wrapper_idx(layer),
+            metadata_summary,
+            _tensor_trace_summary(q),
+            _tensor_trace_summary(paged_kv_cache),
+            _tensor_trace_summary(k_sf),
+            _tensor_trace_summary(v_sf),
+            _scale_trace_value(paged_kv_kwargs.get("k_scale")),
+            _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+        )
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
@@ -945,9 +1009,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 else -1
             )
             if self.is_nvfp4_native:
+                q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                self._trace_nvfp4_native_call(
+                    label="extend_paged",
+                    layer=layer,
+                    q=q_native,
+                    paged_kv_cache=paged_kv_cache,
+                    paged_kv_kwargs=paged_kv_kwargs,
+                )
                 o = self._run_paged_native(
                     prefill_wrapper_paged,
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q_native,
                     paged_kv_cache,
                     causal=causal,
                     sm_scale=layer.scaling,
@@ -1023,9 +1095,17 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer
                 )
                 if self.is_nvfp4_native:
+                    q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                    self._trace_nvfp4_native_call(
+                        label="extend_merge_paged",
+                        layer=layer,
+                        q=q_native,
+                        paged_kv_cache=paged_kv_cache,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                    )
                     o2, s2 = self._run_paged_native(
                         prefill_wrapper_paged,
-                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        q_native,
                         paged_kv_cache,
                         causal=False,
                         sm_scale=layer.scaling,
@@ -1092,9 +1172,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
         paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(layer)
         if self.is_nvfp4_native:
+            q_native = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            self._trace_nvfp4_native_call(
+                label="decode",
+                layer=layer,
+                q=q_native,
+                paged_kv_cache=paged_kv_cache,
+                paged_kv_kwargs=paged_kv_kwargs,
+            )
             o = self._run_paged_native(
                 decode_wrapper,
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q_native,
                 paged_kv_cache,
                 causal=False,
                 sm_scale=layer.scaling,
