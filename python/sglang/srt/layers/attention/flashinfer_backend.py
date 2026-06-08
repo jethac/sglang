@@ -53,6 +53,10 @@ def _fp4_kv_radix_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_RADIX") == "1"
 
 
+def _fp4_kv_page_pair_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_PAGE_PAIR") == "1"
+
+
 def _trace_cpu_values(value):
     if value is None:
         return None
@@ -64,6 +68,29 @@ def _trace_cpu_values(value):
         return list(value)
     except TypeError:
         return value
+
+
+def _trace_tensor_values(value, limit: int = 8):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        flat = value.detach().flatten()
+        length = flat.numel()
+        return {
+            "len": length,
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "head": flat[:limit].to("cpu").tolist(),
+            "tail": flat[max(0, length - limit) :].to("cpu").tolist(),
+        }
+    values = _trace_cpu_values(value)
+    if isinstance(values, list):
+        return {
+            "len": len(values),
+            "head": values[:limit],
+            "tail": values[-limit:] if values else [],
+        }
+    return values
 
 
 def _trace_rids(forward_batch: ForwardBatch):
@@ -226,6 +253,19 @@ def _scale_trace_value(x):
         return float(x)
     except Exception:
         return repr(x)
+
+
+def _page_view_trace_summary(x):
+    if not isinstance(x, torch.Tensor):
+        return _tensor_trace_summary(x)
+    return {
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "stride": tuple(x.stride()),
+        "device": str(x.device),
+        "storage_offset": x.storage_offset(),
+        "data_ptr": x.data_ptr(),
+    }
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -422,6 +462,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         self._nvfp4_trace_seen = set()
         self._nvfp4_batch_trace_seen = set()
+        self._nvfp4_page_pair_trace_seen = set()
+        self._nvfp4_last_paged_plan = {}
 
     def _trace_nvfp4_native_call(
         self,
@@ -508,6 +550,93 @@ class FlashInferAttnBackend(AttentionBackend):
             _tensor_trace_summary(getattr(forward_batch, "req_pool_indices", None)),
             _tensor_trace_summary(getattr(forward_batch, "out_cache_loc", None)),
         )
+
+    def _capture_nvfp4_paged_plan(
+        self,
+        *,
+        label: str,
+        wrapper_id: int,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor],
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        use_ragged: bool,
+    ):
+        if not self.is_nvfp4_native or not _fp4_kv_page_pair_trace_enabled():
+            return
+
+        try:
+            used = int(kv_indptr[-1].detach().to("cpu").item())
+        except Exception:
+            used = 0
+        kv_indices_used = kv_indices[:used]
+        plan = {
+            "label": label,
+            "wrapper_id": int(wrapper_id),
+            "use_ragged": bool(use_ragged),
+            "req_pool_indices": _trace_tensor_values(req_pool_indices),
+            "paged_kernel_lens": _trace_tensor_values(paged_kernel_lens),
+            "prefix_lens": _trace_tensor_values(prefix_lens),
+            "seq_lens": _trace_tensor_values(seq_lens),
+            "kv_start_idx": _trace_tensor_values(kv_start_idx),
+            "kv_indptr": _trace_tensor_values(kv_indptr),
+            "kv_indices_used": _trace_tensor_values(kv_indices_used),
+        }
+        self._nvfp4_last_paged_plan[int(wrapper_id)] = plan
+
+        key = (
+            label,
+            int(wrapper_id),
+            tuple(plan["kv_indptr"]["head"] if plan["kv_indptr"] else ()),
+            tuple(plan["kv_indices_used"]["head"] if plan["kv_indices_used"] else ()),
+            tuple(plan["kv_indices_used"]["tail"] if plan["kv_indices_used"] else ()),
+        )
+        if key in self._nvfp4_page_pair_trace_seen:
+            return
+        self._nvfp4_page_pair_trace_seen.add(key)
+        logger.warning("FP4 KV paged plan trace %s", plan)
+
+    def _trace_nvfp4_page_pair(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        paged_kv_cache,
+        paged_kv_kwargs,
+    ):
+        if not self.is_nvfp4_native or not _fp4_kv_page_pair_trace_enabled():
+            return
+
+        wrapper_id = int(self._get_wrapper_idx(layer))
+        plan = self._nvfp4_last_paged_plan.get(wrapper_id)
+        k_cache, v_cache = paged_kv_cache
+        k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+        first_dims = [
+            tensor.shape[0] if isinstance(tensor, torch.Tensor) else None
+            for tensor in (k_cache, v_cache, k_sf, v_sf)
+        ]
+        summary = {
+            "label": label,
+            "layer": int(layer.layer_id),
+            "wrapper_id": wrapper_id,
+            "plan": plan,
+            "k_cache": _page_view_trace_summary(k_cache),
+            "v_cache": _page_view_trace_summary(v_cache),
+            "k_sf": _page_view_trace_summary(k_sf),
+            "v_sf": _page_view_trace_summary(v_sf),
+            "first_dims": first_dims,
+            "first_dim_match": len(set(first_dims)) == 1,
+            "k_scale": _scale_trace_value(paged_kv_kwargs.get("k_scale")),
+            "v_scale": _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+        }
+        key = (label, int(layer.layer_id), wrapper_id, repr(plan))
+        if key in self._nvfp4_page_pair_trace_seen:
+            return
+        self._nvfp4_page_pair_trace_seen.add(key)
+        logger.warning("FP4 KV page-pair trace %s", summary)
 
     def _get_paged_kv_cache_and_kwargs(self, layer: RadixAttention):
         kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1020,6 +1149,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_cache=paged_kv_cache,
                     paged_kv_kwargs=paged_kv_kwargs,
                 )
+                self._trace_nvfp4_page_pair(
+                    label="extend_paged",
+                    layer=layer,
+                    paged_kv_cache=paged_kv_cache,
+                    paged_kv_kwargs=paged_kv_kwargs,
+                )
                 o = self._run_paged_native(
                     prefill_wrapper_paged,
                     q_native,
@@ -1115,6 +1250,12 @@ class FlashInferAttnBackend(AttentionBackend):
                         label="extend_merge_paged",
                         layer=layer,
                         q=q_native,
+                        paged_kv_cache=paged_kv_cache,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                    )
+                    self._trace_nvfp4_page_pair(
+                        label="extend_merge_paged",
+                        layer=layer,
                         paged_kv_cache=paged_kv_cache,
                         paged_kv_kwargs=paged_kv_kwargs,
                     )
@@ -1580,6 +1721,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            wrapper_id=0,
         )
 
     def update_sliding_window(
@@ -1647,6 +1789,7 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                wrapper_id=wrapper_id,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1735,6 +1878,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                wrapper_id=wrapper_id,
             )
 
     def call_begin_forward(
@@ -1755,6 +1899,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        wrapper_id: int = 0,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1809,6 +1954,19 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_indices[:kv_last_index]
                 )
             )
+
+        self.attn_backend._capture_nvfp4_paged_plan(
+            label="prefill",
+            wrapper_id=wrapper_id,
+            req_pool_indices=req_pool_indices,
+            paged_kernel_lens=paged_kernel_lens,
+            prefix_lens=prefix_lens,
+            seq_lens=seq_lens,
+            kv_start_idx=kv_start_idx,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            use_ragged=use_ragged,
+        )
 
         # cached part
         # Conditionally set multi-item parameters
