@@ -95,6 +95,10 @@ def _fp4_kv_trace_write_read_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_WRITE_READ") == "1"
 
 
+def _fp4_kv_trace_quant_error_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_QUANT_ERROR") == "1"
+
+
 def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -164,6 +168,61 @@ def _fp4_kv_trace_sample_loc_pairs(loc: torch.Tensor):
         seen_pages.add(page_int)
         pairs.append((int(source_index), page_int))
     return pairs
+
+
+def _fp4_kv_trace_numeric_stats(x: torch.Tensor, limit: Optional[int] = None):
+    if limit is None:
+        limit = _fp4_kv_trace_int_env("SGLANG_FP4_KV_TRACE_VALUES", 16)
+    summary = _fp4_kv_trace_tensor_summary(x)
+    try:
+        flat = x.detach().flatten()
+        summary["sample"] = flat[:limit].to("cpu").tolist()
+    except Exception as exc:
+        summary["sample_error"] = repr(exc)
+    try:
+        work = x.detach().float()
+        finite = torch.isfinite(work)
+        summary["finite"] = bool(finite.all().detach().cpu().item())
+        if work.numel() > 0 and bool(finite.any().detach().cpu().item()):
+            finite_values = work[finite]
+            summary["min"] = float(finite_values.min().detach().cpu().item())
+            summary["max"] = float(finite_values.max().detach().cpu().item())
+            summary["mean"] = float(finite_values.mean().detach().cpu().item())
+    except Exception as exc:
+        summary["stats_error"] = repr(exc)
+    return summary
+
+
+def _fp4_kv_trace_compare_tensors(a: torch.Tensor, b: torch.Tensor):
+    summary = {
+        "a": _fp4_kv_trace_tensor_summary(a),
+        "b": _fp4_kv_trace_tensor_summary(b),
+        "shape_match": tuple(a.shape) == tuple(b.shape),
+    }
+    if tuple(a.shape) != tuple(b.shape):
+        return summary
+    try:
+        af = a.detach().float()
+        bf = b.detach().float()
+        diff = af - bf
+        finite = torch.isfinite(af) & torch.isfinite(bf)
+        summary["finite_pair"] = bool(finite.all().detach().cpu().item())
+        if diff.numel() > 0:
+            summary["max_abs"] = float(diff.abs().max().detach().cpu().item())
+            summary["rms"] = float(
+                torch.sqrt(torch.mean(diff * diff)).detach().cpu().item()
+            )
+            summary["cosine"] = float(
+                torch.nn.functional.cosine_similarity(
+                    af.flatten(), bf.flatten(), dim=0, eps=1e-12
+                )
+                .detach()
+                .cpu()
+                .item()
+            )
+    except Exception as exc:
+        summary["compare_error"] = repr(exc)
+    return summary
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -2036,6 +2095,102 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
         return samples
 
+    def _trace_fp4_kv_quant_error(
+        self,
+        *,
+        layer_id: int,
+        loc: torch.Tensor,
+        dense_k: torch.Tensor,
+        dense_v: torch.Tensor,
+        quant_k: torch.Tensor,
+        quant_v: torch.Tensor,
+        quant_k_sf: torch.Tensor,
+        quant_v_sf: torch.Tensor,
+    ):
+        if not _fp4_kv_trace_quant_error_enabled() or not _fp4_kv_trace_layer_enabled(
+            layer_id
+        ):
+            return
+
+        try:
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                NVFP4KVQuantizeUtil,
+            )
+
+            local_layer_id = layer_id - self.start_layer
+            pairs = _fp4_kv_trace_sample_loc_pairs(loc)
+            if not pairs:
+                return
+
+            source_indices = [
+                source_index
+                for source_index, _ in pairs
+                if 0 <= source_index < dense_k.shape[0]
+            ]
+            if not source_indices:
+                return
+
+            sample_idx = torch.tensor(
+                source_indices, dtype=torch.long, device=dense_k.device
+            )
+            dense_k_sample = dense_k.index_select(0, sample_idx)
+            dense_v_sample = dense_v.index_select(0, sample_idx)
+            quant_k_sample = quant_k.index_select(0, sample_idx).view(torch.uint8)
+            quant_v_sample = quant_v.index_select(0, sample_idx).view(torch.uint8)
+            quant_k_sf_sample = quant_k_sf.index_select(0, sample_idx).reshape(
+                len(source_indices), -1
+            )
+            quant_v_sf_sample = quant_v_sf.index_select(0, sample_idx).reshape(
+                len(source_indices), -1
+            )
+            k_global, v_global = self._get_kv_global_scale_tensor(layer_id)
+
+            with torch.no_grad():
+                dequant_k_sample = NVFP4KVQuantizeUtil.dequantize(
+                    quant_k_sample,
+                    quant_k_sf_sample,
+                    k_global,
+                    dtype=dense_k_sample.dtype,
+                )
+                dequant_v_sample = NVFP4KVQuantizeUtil.dequantize(
+                    quant_v_sample,
+                    quant_v_sf_sample,
+                    v_global,
+                    dtype=dense_v_sample.dtype,
+                )
+
+            logger.warning(
+                "FP4 KV quant-error trace %s",
+                {
+                    "layer": int(layer_id),
+                    "local_layer": int(local_layer_id),
+                    "loc_len": int(loc.numel()),
+                    "sample_count": len(source_indices),
+                    "sample_pages": [int(page) for _, page in pairs],
+                    "source_indices": source_indices,
+                    "k_global": float(self.k_global_float[local_layer_id]),
+                    "v_global": float(self.v_global_float[local_layer_id]),
+                    "k": _fp4_kv_trace_compare_tensors(
+                        dense_k_sample, dequant_k_sample
+                    ),
+                    "v": _fp4_kv_trace_compare_tensors(
+                        dense_v_sample, dequant_v_sample
+                    ),
+                    "k_dense": _fp4_kv_trace_numeric_stats(dense_k_sample),
+                    "k_dequant": _fp4_kv_trace_numeric_stats(dequant_k_sample),
+                    "v_dense": _fp4_kv_trace_numeric_stats(dense_v_sample),
+                    "v_dequant": _fp4_kv_trace_numeric_stats(dequant_v_sample),
+                    "k_sf": _fp4_kv_trace_numeric_stats(quant_k_sf_sample),
+                    "v_sf": _fp4_kv_trace_numeric_stats(quant_v_sf_sample),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "FP4 KV quant-error trace failed layer=%s error=%r",
+                layer_id,
+                exc,
+            )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2060,11 +2215,24 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
+        dense_cache_k = cache_k.contiguous()
+        dense_cache_v = cache_v.contiguous()
         cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
-            cache_k.contiguous(), k_global
+            dense_cache_k, k_global
         )
         cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
-            cache_v.contiguous(), v_global
+            dense_cache_v, v_global
+        )
+
+        self._trace_fp4_kv_quant_error(
+            layer_id=layer_id,
+            loc=loc,
+            dense_k=dense_cache_k,
+            dense_v=dense_cache_v,
+            quant_k=cache_k,
+            quant_v=cache_v,
+            quant_k_sf=cache_k_fp4_sf,
+            quant_v_sf=cache_v_fp4_sf,
         )
 
         cache_k = cache_k.view(self.store_dtype)
