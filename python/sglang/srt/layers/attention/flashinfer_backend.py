@@ -1154,6 +1154,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits / float(logits_soft_cap)
                 )
             lse_ref = torch.logsumexp(logits, dim=-1)
+            lse_ref_base2 = lse_ref * 1.4426950408889634
             probs = torch.softmax(logits, dim=-1)
             o2_ref = torch.einsum("qht,thd->qhd", probs, v_for_q).to(o2.dtype)
 
@@ -1164,6 +1165,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 "k_dequant": _trace_numeric_tensor_stats(k_ref),
                 "v_dequant": _trace_numeric_tensor_stats(v_ref),
                 "lse_ref": _trace_numeric_tensor_stats(lse_ref),
+                "lse_ref_base2": _trace_numeric_tensor_stats(lse_ref_base2),
                 "o2_ref": _trace_numeric_tensor_stats(o2_ref),
                 "o2_flashinfer": _trace_numeric_tensor_stats(o2_slice),
                 "o2_compare": _trace_compare_tensors(o2_ref, o2_slice),
@@ -1173,7 +1175,10 @@ class FlashInferAttnBackend(AttentionBackend):
                     s2_slice
                 )
                 summary["reference"]["s2_compare"] = _trace_compare_tensors(
-                    lse_ref, s2_slice
+                    lse_ref_base2, s2_slice
+                )
+                summary["reference"]["s2_compare_natural_log"] = (
+                    _trace_compare_tensors(lse_ref, s2_slice)
                 )
             else:
                 summary["reference"]["s2_compare"] = {
@@ -1189,8 +1194,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 s1_work = s1_slice.float().unsqueeze(-1)
                 s2_work = s2_slice.float().unsqueeze(-1)
                 m = torch.maximum(s1_work, s2_work)
-                w1 = torch.exp(s1_work - m)
-                w2 = torch.exp(s2_work - m)
+                w1 = torch.exp2(s1_work - m)
+                w2 = torch.exp2(s2_work - m)
                 manual_merged = ((o1_slice * w1) + (o2_slice_f * w2)) / (w1 + w2)
                 summary["merge_compare"] = _trace_compare_tensors(
                     manual_merged.to(merged.dtype), merged_slice
