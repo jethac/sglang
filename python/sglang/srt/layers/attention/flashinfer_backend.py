@@ -57,6 +57,28 @@ def _fp4_kv_page_pair_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_PAGE_PAIR") == "1"
 
 
+def _fp4_kv_merge_state_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_MERGE_STATE") == "1"
+
+
+def _trace_layer_enabled(layer_id: int) -> bool:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
+    if raw in (None, ""):
+        return True
+    enabled = {item.strip() for item in raw.split(",") if item.strip()}
+    return str(layer_id) in enabled
+
+
+def _trace_value_limit(default: int = 8) -> int:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_VALUES")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
 def _trace_cpu_values(value):
     if value is None:
         return None
@@ -268,6 +290,109 @@ def _page_view_trace_summary(x):
     }
 
 
+def _trace_numeric_tensor_stats(x, limit: Optional[int] = None):
+    if not isinstance(x, torch.Tensor):
+        return _tensor_trace_summary(x)
+    if limit is None:
+        limit = _trace_value_limit()
+
+    summary = _tensor_trace_summary(x)
+    try:
+        flat = x.detach().flatten()
+        sample = flat[:limit].to("cpu")
+        summary["sample"] = sample.tolist()
+    except Exception as exc:
+        summary["sample_error"] = repr(exc)
+        flat = None
+
+    try:
+        work = x.detach().float()
+        finite = torch.isfinite(work)
+        summary["finite"] = bool(finite.all().detach().cpu().item())
+        if work.numel() > 0 and bool(finite.any().detach().cpu().item()):
+            finite_values = work[finite]
+            summary["min"] = float(finite_values.min().detach().cpu().item())
+            summary["max"] = float(finite_values.max().detach().cpu().item())
+            summary["mean"] = float(finite_values.mean().detach().cpu().item())
+    except Exception as exc:
+        summary["stats_error"] = repr(exc)
+
+    return summary
+
+
+def _trace_tensor_raw_bytes(x, limit: Optional[int] = None):
+    if not isinstance(x, torch.Tensor):
+        return _tensor_trace_summary(x)
+    if limit is None:
+        limit = _trace_value_limit(16)
+
+    try:
+        byte_view = x.detach().contiguous().view(torch.uint8).flatten()
+        return {
+            "shape": tuple(x.shape),
+            "dtype": str(x.dtype),
+            "stride": tuple(x.stride()),
+            "bytes": byte_view[:limit].to("cpu").tolist(),
+        }
+    except Exception as exc:
+        summary = _tensor_trace_summary(x)
+        summary["bytes_error"] = repr(exc)
+        return summary
+
+
+def _trace_sample_page_bytes(x, page_ids, limit: Optional[int] = None):
+    if not isinstance(x, torch.Tensor):
+        return _tensor_trace_summary(x)
+    if limit is None:
+        limit = _trace_value_limit(16)
+
+    samples = []
+    for page_id in page_ids:
+        try:
+            page = int(page_id)
+        except (TypeError, ValueError):
+            samples.append({"page": repr(page_id), "error": "invalid page id"})
+            continue
+
+        if page < 0 or page >= x.shape[0]:
+            samples.append(
+                {
+                    "page": page,
+                    "error": "page out of range",
+                    "first_dim": int(x.shape[0]),
+                }
+            )
+            continue
+
+        samples.append(
+            {
+                "page": page,
+                "value": _trace_tensor_raw_bytes(x[page], limit=limit),
+            }
+        )
+    return samples
+
+
+def _trace_plan_sample_pages(plan, limit: int = 4):
+    if not isinstance(plan, dict):
+        return []
+    kv_indices = plan.get("kv_indices_used")
+    if not isinstance(kv_indices, dict):
+        return []
+    values = list(kv_indices.get("head") or []) + list(kv_indices.get("tail") or [])
+    pages = []
+    for value in values:
+        try:
+            page = int(value)
+        except (TypeError, ValueError):
+            continue
+        if page not in pages:
+            pages.append(page)
+        if len(pages) >= limit:
+            break
+    return pages
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -463,6 +588,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_trace_seen = set()
         self._nvfp4_batch_trace_seen = set()
         self._nvfp4_page_pair_trace_seen = set()
+        self._nvfp4_merge_state_trace_seen = set()
         self._nvfp4_last_paged_plan = {}
 
     def _trace_nvfp4_native_call(
@@ -637,6 +763,69 @@ class FlashInferAttnBackend(AttentionBackend):
             return
         self._nvfp4_page_pair_trace_seen.add(key)
         logger.warning("FP4 KV page-pair trace %s", summary)
+
+    def _trace_nvfp4_merge_state(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        paged_kv_cache,
+        paged_kv_kwargs,
+        o1: torch.Tensor,
+        s1: torch.Tensor,
+        o2: torch.Tensor,
+        s2: torch.Tensor,
+        merged: Optional[torch.Tensor],
+        swa_window_left: Optional[int],
+    ):
+        if (
+            not self.is_nvfp4_native
+            or not _fp4_kv_merge_state_trace_enabled()
+            or not _trace_layer_enabled(int(layer.layer_id))
+        ):
+            return
+
+        wrapper_id = int(self._get_wrapper_idx(layer))
+        plan = self._nvfp4_last_paged_plan.get(wrapper_id)
+        page_ids = _trace_plan_sample_pages(plan)
+        key = (
+            label,
+            int(layer.layer_id),
+            wrapper_id,
+            tuple(page_ids),
+            _tensor_trace_summary(o1),
+            _tensor_trace_summary(o2),
+        )
+        if key in self._nvfp4_merge_state_trace_seen:
+            return
+        self._nvfp4_merge_state_trace_seen.add(key)
+
+        k_cache, v_cache = paged_kv_cache
+        k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+        summary = {
+            "label": label,
+            "layer": int(layer.layer_id),
+            "wrapper_id": wrapper_id,
+            "swa_window_left": swa_window_left,
+            "plan": plan,
+            "sample_page_ids": page_ids,
+            "page_bytes": {
+                "k_cache": _trace_sample_page_bytes(k_cache, page_ids),
+                "v_cache": _trace_sample_page_bytes(v_cache, page_ids),
+                "k_sf": _trace_sample_page_bytes(k_sf, page_ids),
+                "v_sf": _trace_sample_page_bytes(v_sf, page_ids),
+            },
+            "k_scale": _scale_trace_value(paged_kv_kwargs.get("k_scale")),
+            "v_scale": _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+            "merge_inputs": {
+                "o1_ragged": _trace_numeric_tensor_stats(o1),
+                "s1_ragged": _trace_numeric_tensor_stats(s1),
+                "o2_paged": _trace_numeric_tensor_stats(o2),
+                "s2_paged": _trace_numeric_tensor_stats(s2),
+            },
+            "merged": _trace_numeric_tensor_stats(merged),
+        }
+        logger.warning("FP4 KV merge-state trace %s", summary)
 
     def _get_paged_kv_cache_and_kwargs(self, layer: RadixAttention):
         kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -1282,6 +1471,19 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
+                if self.is_nvfp4_native:
+                    self._trace_nvfp4_merge_state(
+                        label="extend_merge_paged",
+                        layer=layer,
+                        paged_kv_cache=paged_kv_cache,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                        o1=o1,
+                        s1=s1,
+                        o2=o2,
+                        s2=s2,
+                        merged=o,
+                        swa_window_left=swa_window_left,
+                    )
 
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
