@@ -73,6 +73,24 @@ def _fp4_kv_dense_quant_attention_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_QUANT_ATTENTION") == "1"
 
 
+def _trace_k_scale_multipliers() -> List[float]:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_K_SCALE_MULTIPLIERS")
+    if raw in (None, ""):
+        return []
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = float(item)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return values[:16]
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -1142,6 +1160,25 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_global,
                 dtype=v3.dtype,
             ).view_as(v3)
+            k_scale_multiplier_refs = []
+            for multiplier in _trace_k_scale_multipliers():
+                alt_k_global = (k_global.float() * multiplier).contiguous()
+                alt_k_fp4, alt_k_sf, _ = NVFP4KVQuantizeUtil.quantize(
+                    k3, alt_k_global
+                )
+                alt_k_deq = NVFP4KVQuantizeUtil.dequantize(
+                    alt_k_fp4.view(torch.uint8),
+                    alt_k_sf.reshape(k3.shape[0], -1),
+                    alt_k_global,
+                    dtype=k3.dtype,
+                ).view_as(k3)
+                k_scale_multiplier_refs.append(
+                    {
+                        "multiplier": multiplier,
+                        "k_global": _scale_trace_value(alt_k_global),
+                        "k_deq": alt_k_deq,
+                    }
+                )
 
             sample_rows = _trace_sample_rows(forward_batch, int(o3.shape[0]))
             head_repeat = layer.tp_q_head_num // layer.tp_k_head_num
@@ -1174,32 +1211,54 @@ class FlashInferAttnBackend(AttentionBackend):
                 fp4_ref = attention_ref(k_deq, v_deq, row_id)
                 fp4_k_ref = attention_ref(k_deq, v3, row_id)
                 fp4_v_ref = attention_ref(k3, v_deq, row_id)
+                multiplier_rows = []
+                for alt in k_scale_multiplier_refs:
+                    alt_k_deq = alt["k_deq"]
+                    alt_fp4_ref = attention_ref(alt_k_deq, v_deq, row_id)
+                    alt_fp4_k_ref = attention_ref(alt_k_deq, v3, row_id)
+                    multiplier_rows.append(
+                        {
+                            "multiplier": alt["multiplier"],
+                            "k_global": alt["k_global"],
+                            "k_dequant_prefix_vs_bf16_prefix": (
+                                _trace_compare_tensors(
+                                    alt_k_deq[: row_id + 1],
+                                    k3[: row_id + 1],
+                                )
+                            ),
+                            "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
+                                alt_fp4_ref, bf16_ref
+                            ),
+                            "fp4_k_only_ref_vs_bf16_ref": (
+                                _trace_compare_tensors(alt_fp4_k_ref, bf16_ref)
+                            ),
+                        }
+                    )
                 actual = o3[row_id]
-                rows.append(
-                    {
-                        "row": row_id,
-                        "actual_vs_bf16_ref": _trace_compare_tensors(
-                            actual, bf16_ref
-                        ),
-                        "actual_vs_fp4_ref": _trace_compare_tensors(
-                            actual, fp4_ref
-                        ),
-                        "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
-                            fp4_ref, bf16_ref
-                        ),
-                        "fp4_k_only_ref_vs_bf16_ref": _trace_compare_tensors(
-                            fp4_k_ref, bf16_ref
-                        ),
-                        "fp4_v_only_ref_vs_bf16_ref": _trace_compare_tensors(
-                            fp4_v_ref, bf16_ref
-                        ),
-                        "actual": _trace_numeric_tensor_stats(actual),
-                        "bf16_ref": _trace_numeric_tensor_stats(bf16_ref),
-                        "fp4_ref": _trace_numeric_tensor_stats(fp4_ref),
-                        "fp4_k_only_ref": _trace_numeric_tensor_stats(fp4_k_ref),
-                        "fp4_v_only_ref": _trace_numeric_tensor_stats(fp4_v_ref),
-                    }
-                )
+                row_record = {
+                    "row": row_id,
+                    "actual_vs_bf16_ref": _trace_compare_tensors(
+                        actual, bf16_ref
+                    ),
+                    "actual_vs_fp4_ref": _trace_compare_tensors(actual, fp4_ref),
+                    "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
+                        fp4_ref, bf16_ref
+                    ),
+                    "fp4_k_only_ref_vs_bf16_ref": _trace_compare_tensors(
+                        fp4_k_ref, bf16_ref
+                    ),
+                    "fp4_v_only_ref_vs_bf16_ref": _trace_compare_tensors(
+                        fp4_v_ref, bf16_ref
+                    ),
+                    "actual": _trace_numeric_tensor_stats(actual),
+                    "bf16_ref": _trace_numeric_tensor_stats(bf16_ref),
+                    "fp4_ref": _trace_numeric_tensor_stats(fp4_ref),
+                    "fp4_k_only_ref": _trace_numeric_tensor_stats(fp4_k_ref),
+                    "fp4_v_only_ref": _trace_numeric_tensor_stats(fp4_v_ref),
+                }
+                if multiplier_rows:
+                    row_record["k_scale_multiplier_refs"] = multiplier_rows
+                rows.append(row_record)
 
             if rows:
                 logger.warning(
