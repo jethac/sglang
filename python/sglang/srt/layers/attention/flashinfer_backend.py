@@ -65,6 +65,10 @@ def _fp4_kv_prefix_ref_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_PREFIX_REF") == "1"
 
 
+def _fp4_kv_dense_cache_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -419,6 +423,51 @@ def _trace_tensor_key(x):
     )
 
 
+def _trace_sample_rows(forward_batch: ForwardBatch, fallback_tokens: int):
+    try:
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu:
+            rows = []
+            cursor = 0
+            for seq_len in extend_seq_lens_cpu:
+                cursor += int(seq_len)
+                rows.append(cursor - 1)
+            return rows
+    except Exception:
+        pass
+    if fallback_tokens <= 0:
+        return []
+    return [fallback_tokens - 1]
+
+
+def _trace_tensor_rows(x, rows, limit: Optional[int] = None):
+    if not isinstance(x, torch.Tensor):
+        return _tensor_trace_summary(x)
+    if limit is None:
+        limit = _trace_value_limit()
+    samples = []
+    for row in rows:
+        try:
+            row_id = int(row)
+        except (TypeError, ValueError):
+            samples.append({"row": repr(row), "error": "invalid row"})
+            continue
+        if row_id < 0 or row_id >= x.shape[0]:
+            samples.append(
+                {
+                    "row": row_id,
+                    "error": "row out of range",
+                    "first_dim": int(x.shape[0]),
+                }
+            )
+            continue
+        samples.append({"row": row_id, "value": _trace_numeric_tensor_stats(x[row_id], limit)})
+    return {
+        "tensor": _tensor_trace_summary(x),
+        "rows": samples,
+    }
+
+
 def _trace_nvfp4_write_samples(token_to_kv_pool, layer_id: int, page_ids):
     try:
         kv_pool, local_layer_id = _nvfp4_inner_pool_and_layer_id(
@@ -687,6 +736,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_page_pair_trace_seen = set()
         self._nvfp4_merge_state_trace_seen = set()
         self._nvfp4_prefix_ref_trace_seen = set()
+        self._nvfp4_dense_cache_trace_seen = set()
         self._nvfp4_last_paged_plan = {}
         self._nvfp4_last_paged_plan_tensors = {}
 
@@ -953,6 +1003,92 @@ class FlashInferAttnBackend(AttentionBackend):
             "merged": _trace_numeric_tensor_stats(merged),
         }
         logger.warning("FP4 KV merge-state trace %s", summary)
+
+    def _trace_nvfp4_dense_cache_state(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        q: Optional[torch.Tensor] = None,
+        o: Optional[torch.Tensor] = None,
+        o1: Optional[torch.Tensor] = None,
+        s1: Optional[torch.Tensor] = None,
+        o2: Optional[torch.Tensor] = None,
+        s2: Optional[torch.Tensor] = None,
+        merged: Optional[torch.Tensor] = None,
+        paged_kv_kwargs: Optional[dict] = None,
+    ):
+        if (
+            not self.is_nvfp4_native
+            or not _fp4_kv_dense_cache_trace_enabled()
+            or not _trace_layer_enabled(int(layer.layer_id))
+        ):
+            return
+
+        rids = _trace_rids(forward_batch)
+        rid_filter = os.environ.get("SGLANG_FP4_KV_TRACE_RID")
+        if rid_filter not in (None, "") and (rids is None or rid_filter not in rids):
+            return
+
+        extend_prefix_lens_cpu = _trace_cpu_values(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        )
+        extend_seq_lens_cpu = _trace_cpu_values(
+            getattr(forward_batch, "extend_seq_lens_cpu", None)
+        )
+        seq_lens_cpu = _trace_cpu_values(getattr(forward_batch, "seq_lens_cpu", None))
+        row_source = o if isinstance(o, torch.Tensor) else merged
+        if not isinstance(row_source, torch.Tensor):
+            row_source = o1 if isinstance(o1, torch.Tensor) else q
+        sample_rows = _trace_sample_rows(
+            forward_batch,
+            int(row_source.shape[0]) if isinstance(row_source, torch.Tensor) else 0,
+        )
+        key = (
+            label,
+            int(layer.layer_id),
+            tuple(rids or ()),
+            tuple(extend_prefix_lens_cpu or ()),
+            tuple(extend_seq_lens_cpu or ()),
+            tuple(sample_rows),
+            _trace_tensor_key(row_source),
+        )
+        if key in self._nvfp4_dense_cache_trace_seen:
+            return
+        self._nvfp4_dense_cache_trace_seen.add(key)
+
+        wrapper_id = int(self._get_wrapper_idx(layer))
+        summary = {
+            "label": label,
+            "layer": int(layer.layer_id),
+            "wrapper_id": wrapper_id,
+            "rids": rids,
+            "mode": repr(getattr(forward_batch, "forward_mode", None)),
+            "seq_lens_cpu": seq_lens_cpu,
+            "extend_prefix_lens_cpu": extend_prefix_lens_cpu,
+            "extend_seq_lens_cpu": extend_seq_lens_cpu,
+            "sample_rows": sample_rows,
+            "req_pool_indices": _trace_tensor_values(
+                getattr(forward_batch, "req_pool_indices", None)
+            ),
+            "out_cache_loc": _trace_tensor_values(
+                getattr(forward_batch, "out_cache_loc", None)
+            ),
+            "q_rows": _trace_tensor_rows(q, sample_rows) if q is not None else None,
+            "o_rows": _trace_tensor_rows(o, sample_rows) if o is not None else None,
+            "o1_rows": _trace_tensor_rows(o1, sample_rows) if o1 is not None else None,
+            "s1_rows": _trace_tensor_rows(s1, sample_rows) if s1 is not None else None,
+            "o2_rows": _trace_tensor_rows(o2, sample_rows) if o2 is not None else None,
+            "s2_rows": _trace_tensor_rows(s2, sample_rows) if s2 is not None else None,
+            "merged_rows": (
+                _trace_tensor_rows(merged, sample_rows) if merged is not None else None
+            ),
+        }
+        if paged_kv_kwargs is not None:
+            summary["k_scale"] = _scale_trace_value(paged_kv_kwargs.get("k_scale"))
+            summary["v_scale"] = _scale_trace_value(paged_kv_kwargs.get("v_scale"))
+        logger.warning("FP4 KV dense-cache attention trace %s", summary)
 
     def _trace_nvfp4_prefix_reference(
         self,
@@ -1681,6 +1817,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     return_lse=False,
                     paged_kv_kwargs=paged_kv_kwargs,
                 )
+                self._trace_nvfp4_dense_cache_state(
+                    label="forward_extend_paged",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    q=q_native,
+                    o=o,
+                    paged_kv_kwargs=paged_kv_kwargs,
+                )
             else:
                 o = prefill_wrapper_paged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1731,6 +1875,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                if self.is_nvfp4_native:
+                    self._trace_nvfp4_dense_cache_state(
+                        label="forward_extend_ragged_no_prefix",
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        o=o,
+                    )
 
             else:
                 swa_window_left = (
@@ -1798,6 +1950,18 @@ class FlashInferAttnBackend(AttentionBackend):
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
                 if self.is_nvfp4_native:
+                    self._trace_nvfp4_dense_cache_state(
+                        label="forward_extend_merge_paged",
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        q=q_native,
+                        o1=o1,
+                        s1=s1,
+                        o2=o2,
+                        s2=s2,
+                        merged=o,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                    )
                     self._trace_nvfp4_merge_state(
                         label="extend_merge_paged",
                         layer=layer,
