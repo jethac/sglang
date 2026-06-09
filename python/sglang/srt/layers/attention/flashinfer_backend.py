@@ -780,6 +780,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_dense_cache_trace_seen = set()
         self._nvfp4_last_paged_plan = {}
         self._nvfp4_last_paged_plan_tensors = {}
+        self._nvfp4_dense_reference_by_layer = {}
 
     def _trace_nvfp4_native_call(
         self,
@@ -1166,6 +1167,21 @@ class FlashInferAttnBackend(AttentionBackend):
             k3 = k.view(-1, layer.tp_k_head_num, layer.head_dim).contiguous()
             v3 = v.view(-1, layer.tp_v_head_num, layer.head_dim).contiguous()
             o3 = o.view(-1, layer.tp_q_head_num, layer.head_dim).contiguous()
+            if label == "forward_extend_ragged_no_prefix":
+                self._nvfp4_dense_reference_by_layer[int(layer.layer_id)] = {
+                    "q": q3.detach(),
+                    "k": k3.detach(),
+                    "v": v3.detach(),
+                    "o": o3.detach(),
+                    "rids": _trace_rids(forward_batch),
+                    "seq_lens_cpu": _trace_cpu_values(
+                        getattr(forward_batch, "seq_lens_cpu", None)
+                    ),
+                    "extend_seq_lens_cpu": _trace_cpu_values(
+                        getattr(forward_batch, "extend_seq_lens_cpu", None)
+                    ),
+                    "forward_pass_id": getattr(forward_batch, "forward_pass_id", None),
+                }
 
             k_fp4, k_sf, _ = NVFP4KVQuantizeUtil.quantize(k3, k_global)
             v_fp4, v_sf, _ = NVFP4KVQuantizeUtil.quantize(v3, v_global)
@@ -1566,8 +1582,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
             s1_slice = _trace_select_lse_slice(s1, qo_start, qo_end, qo_end - qo_start)
             merged_slice = merged[qo_start:qo_end]
+            o1_slice = o1[qo_start:qo_end].float()
             if isinstance(s1_slice, torch.Tensor) and isinstance(s2_slice, torch.Tensor):
-                o1_slice = o1[qo_start:qo_end].float()
                 o2_slice_f = o2_slice.float()
                 s1_work = s1_slice.float().unsqueeze(-1)
                 s2_work = s2_slice.float().unsqueeze(-1)
@@ -1583,6 +1599,146 @@ class FlashInferAttnBackend(AttentionBackend):
                     "error": "could not select comparable s1/s2 slices",
                     "s1": _tensor_trace_summary(s1),
                     "s2": _tensor_trace_summary(s2),
+                }
+
+            dense_ref = self._nvfp4_dense_reference_by_layer.get(int(layer.layer_id))
+            if isinstance(dense_ref, dict):
+                q_len = qo_end - qo_start
+                dense_row_start = int(prefix_lens[req_idx].detach().cpu().item())
+                dense_row_end = dense_row_start + q_len
+                dense_q = dense_ref["q"]
+                dense_k = dense_ref["k"]
+                dense_v = dense_ref["v"]
+                dense_o = dense_ref["o"]
+                summary["dense_reference"] = {
+                    "dense_rids": dense_ref.get("rids"),
+                    "dense_forward_pass_id": dense_ref.get("forward_pass_id"),
+                    "dense_seq_lens_cpu": dense_ref.get("seq_lens_cpu"),
+                    "dense_extend_seq_lens_cpu": dense_ref.get("extend_seq_lens_cpu"),
+                    "dense_row_range": [dense_row_start, dense_row_end],
+                }
+                if dense_row_end <= dense_q.shape[0]:
+                    dense_q_req = dense_q[dense_row_start:dense_row_end].float()
+                    dense_prefix_k = dense_k[:dense_row_start].float()
+                    dense_prefix_v = dense_v[:dense_row_start].float()
+                    dense_suffix_k = dense_k[dense_row_start:dense_row_end].float()
+                    dense_suffix_v = dense_v[dense_row_start:dense_row_end].float()
+                    dense_full_k = dense_k[:dense_row_end].float()
+                    dense_full_v = dense_v[:dense_row_end].float()
+                    dense_o_slice = dense_o[dense_row_start:dense_row_end]
+                    q_req_f = q_req.float()
+
+                    def dense_attention_ref(kv_k: torch.Tensor, kv_v: torch.Tensor):
+                        if kv_k.shape[0] == 0:
+                            out = torch.zeros_like(q_req_f)
+                            lse = torch.full(
+                                q_req_f.shape[:2],
+                                float("-inf"),
+                                dtype=torch.float32,
+                                device=q_req_f.device,
+                            )
+                            return out, lse
+                        q_heads = q_req_f.shape[1]
+                        kv_heads = kv_k.shape[1]
+                        kv_head_for_q = torch.arange(q_heads, device=q_req_f.device) // (
+                            q_heads // kv_heads
+                        )
+                        k_for_q = kv_k[:, kv_head_for_q, :]
+                        v_for_q = kv_v[:, kv_head_for_q, :]
+                        logits = (
+                            torch.einsum("qhd,thd->qht", q_req_f, k_for_q)
+                            * float(sm_scale)
+                        )
+                        if logits_soft_cap is not None and float(logits_soft_cap) > 0:
+                            logits = float(logits_soft_cap) * torch.tanh(
+                                logits / float(logits_soft_cap)
+                            )
+                        lse = torch.logsumexp(logits, dim=-1)
+                        probs = torch.softmax(logits, dim=-1)
+                        out = torch.einsum("qht,thd->qhd", probs, v_for_q)
+                        return out, lse
+
+                    def dense_causal_suffix_ref(kv_k: torch.Tensor, kv_v: torch.Tensor):
+                        outs = []
+                        lses = []
+                        for row_idx in range(q_req_f.shape[0]):
+                            out_i, lse_i = dense_attention_ref(
+                                kv_k[: row_idx + 1],
+                                kv_v[: row_idx + 1],
+                            )
+                            outs.append(out_i[row_idx : row_idx + 1])
+                            lses.append(lse_i[row_idx : row_idx + 1])
+                        return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+                    def dense_causal_full_ref(kv_k: torch.Tensor, kv_v: torch.Tensor):
+                        outs = []
+                        lses = []
+                        for row_idx in range(q_req_f.shape[0]):
+                            end = dense_row_start + row_idx + 1
+                            out_i, lse_i = dense_attention_ref(kv_k[:end], kv_v[:end])
+                            outs.append(out_i[row_idx : row_idx + 1])
+                            lses.append(lse_i[row_idx : row_idx + 1])
+                        return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+                    dense_prefix_o, dense_prefix_lse = dense_attention_ref(
+                        dense_prefix_k, dense_prefix_v
+                    )
+                    dense_suffix_o, dense_suffix_lse = dense_causal_suffix_ref(
+                        dense_suffix_k, dense_suffix_v
+                    )
+                    dense_full_o, dense_full_lse = dense_causal_full_ref(
+                        dense_full_k, dense_full_v
+                    )
+                    dense_prefix_lse_base2 = dense_prefix_lse * 1.4426950408889634
+                    dense_suffix_lse_base2 = dense_suffix_lse * 1.4426950408889634
+                    dense_full_lse_base2 = dense_full_lse * 1.4426950408889634
+                    dense_section = summary["dense_reference"]
+                    dense_section.update(
+                        {
+                            "q_compare": _trace_compare_tensors(dense_q_req, q_req_f),
+                            "dense_o_flashinfer": _trace_numeric_tensor_stats(
+                                dense_o_slice
+                            ),
+                            "dense_full_ref": _trace_numeric_tensor_stats(dense_full_o),
+                            "dense_o_compare": _trace_compare_tensors(
+                                dense_full_o.to(dense_o_slice.dtype), dense_o_slice
+                            ),
+                            "prefix_o_vs_o2": _trace_compare_tensors(
+                                dense_prefix_o.to(o2_slice.dtype), o2_slice
+                            ),
+                            "prefix_lse_base2_vs_s2": (
+                                _trace_compare_tensors(dense_prefix_lse_base2, s2_slice)
+                                if isinstance(s2_slice, torch.Tensor)
+                                else {"error": "missing s2 slice"}
+                            ),
+                            "suffix_o_vs_o1": (
+                                _trace_compare_tensors(
+                                    dense_suffix_o.to(o1_slice.dtype), o1_slice
+                                )
+                                if isinstance(s1_slice, torch.Tensor)
+                                else {"error": "missing s1 slice"}
+                            ),
+                            "suffix_lse_base2_vs_s1": (
+                                _trace_compare_tensors(dense_suffix_lse_base2, s1_slice)
+                                if isinstance(s1_slice, torch.Tensor)
+                                else {"error": "missing s1 slice"}
+                            ),
+                            "full_o_vs_merged": _trace_compare_tensors(
+                                dense_full_o.to(merged_slice.dtype), merged_slice
+                            ),
+                            "full_lse_base2": _trace_numeric_tensor_stats(
+                                dense_full_lse_base2
+                            ),
+                        }
+                    )
+                else:
+                    summary["dense_reference"]["error"] = "dense reference too short"
+                    summary["dense_reference"]["dense_shape"] = _tensor_trace_summary(
+                        dense_q
+                    )
+            else:
+                summary["dense_reference"] = {
+                    "error": "missing dense no-prefix reference"
                 }
         except Exception as exc:
             summary["error"] = repr(exc)
