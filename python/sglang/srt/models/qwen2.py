@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -59,6 +60,141 @@ Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
+
+
+def _fp4_kv_dense_cache_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
+
+
+def _dense_cache_trace_layer_enabled(layer_id: int) -> bool:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
+    if raw in (None, ""):
+        return True
+    enabled = {item.strip() for item in raw.split(",") if item.strip()}
+    return str(layer_id) in enabled
+
+
+def _dense_cache_trace_value_limit(default: int = 8) -> int:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_VALUES")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _dense_cache_trace_rids(forward_batch: ForwardBatch):
+    rids = getattr(forward_batch, "rids", None)
+    if rids is None:
+        return None
+    return [str(rid) for rid in rids]
+
+
+def _dense_cache_trace_rows(forward_batch: ForwardBatch, fallback_tokens: int):
+    try:
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu:
+            rows = []
+            cursor = 0
+            for seq_len in extend_seq_lens_cpu:
+                cursor += int(seq_len)
+                rows.append(cursor - 1)
+            return rows
+    except Exception:
+        pass
+    if fallback_tokens <= 0:
+        return []
+    return [fallback_tokens - 1]
+
+
+def _dense_cache_trace_tensor_rows(x, rows):
+    if not isinstance(x, torch.Tensor):
+        return repr(x)
+    limit = _dense_cache_trace_value_limit()
+    samples = []
+    for row in rows:
+        try:
+            row_id = int(row)
+        except (TypeError, ValueError):
+            samples.append({"row": repr(row), "error": "invalid row"})
+            continue
+        if row_id < 0 or row_id >= x.shape[0]:
+            samples.append(
+                {
+                    "row": row_id,
+                    "error": "row out of range",
+                    "first_dim": int(x.shape[0]),
+                }
+            )
+            continue
+        try:
+            row_tensor = x[row_id].detach()
+            flat = row_tensor.flatten()
+            work = row_tensor.float()
+            finite = torch.isfinite(work)
+            item = {
+                "row": row_id,
+                "shape": tuple(row_tensor.shape),
+                "dtype": str(row_tensor.dtype),
+                "sample": flat[:limit].to("cpu").tolist(),
+                "finite": bool(finite.all().detach().cpu().item()),
+            }
+            if work.numel() > 0 and bool(finite.any().detach().cpu().item()):
+                finite_values = work[finite]
+                item.update(
+                    {
+                        "min": float(finite_values.min().detach().cpu().item()),
+                        "max": float(finite_values.max().detach().cpu().item()),
+                        "mean": float(finite_values.mean().detach().cpu().item()),
+                    }
+                )
+            samples.append(item)
+        except Exception as exc:
+            samples.append({"row": row_id, "error": repr(exc)})
+    return {
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "stride": tuple(x.stride()),
+        "device": str(x.device),
+        "rows": samples,
+    }
+
+
+def _trace_qwen2_dense_cache_state(
+    *,
+    label: str,
+    layer_id: Optional[int],
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+):
+    if not _fp4_kv_dense_cache_trace_enabled():
+        return
+    if layer_id is not None and not _dense_cache_trace_layer_enabled(int(layer_id)):
+        return
+    rids = _dense_cache_trace_rids(forward_batch)
+    rid_filter = os.environ.get("SGLANG_FP4_KV_TRACE_RID")
+    if rid_filter not in (None, "") and (rids is None or rid_filter not in rids):
+        return
+    rows = _dense_cache_trace_rows(
+        forward_batch,
+        int(hidden_states.shape[0]) if isinstance(hidden_states, torch.Tensor) else 0,
+    )
+    logger.warning(
+        "FP4 KV dense-cache Qwen2 trace %s",
+        {
+            "label": label,
+            "layer": layer_id,
+            "rids": rids,
+            "mode": repr(getattr(forward_batch, "forward_mode", None)),
+            "extend_prefix_lens_cpu": getattr(
+                forward_batch, "extend_prefix_lens_cpu", None
+            ),
+            "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
+            "sample_rows": rows,
+            "hidden_rows": _dense_cache_trace_tensor_rows(hidden_states, rows),
+        },
+    )
 
 
 class Qwen2MLP(nn.Module):
@@ -209,6 +345,7 @@ class Qwen2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.start_layer = start_layer
+        self.layer_id = layer_id
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
@@ -258,10 +395,28 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        _trace_qwen2_dense_cache_state(
+            label="decoder_after_self_attn",
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+        )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _trace_qwen2_dense_cache_state(
+            label="decoder_after_post_attention_norm",
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+        )
         hidden_states = self.mlp(hidden_states)
+        _trace_qwen2_dense_cache_state(
+            label="decoder_after_mlp",
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            hidden_states=hidden_states,
+        )
         return hidden_states, residual
 
 
@@ -392,6 +547,12 @@ class Qwen2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                _trace_qwen2_dense_cache_state(
+                    label="model_after_final_norm",
+                    layer_id=None,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

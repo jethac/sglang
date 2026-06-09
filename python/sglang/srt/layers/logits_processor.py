@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -62,6 +63,95 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _fp4_kv_dense_cache_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
+
+
+def _dense_cache_trace_value_limit(default: int = 8) -> int:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_VALUES")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _dense_cache_trace_tensor(x: Optional[torch.Tensor], limit: Optional[int] = None):
+    if x is None:
+        return None
+    if not isinstance(x, torch.Tensor):
+        return repr(x)
+    if limit is None:
+        limit = _dense_cache_trace_value_limit()
+    summary = {
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "stride": tuple(x.stride()),
+        "device": str(x.device),
+    }
+    try:
+        flat = x.detach().flatten()
+        summary["sample"] = flat[:limit].to("cpu").tolist()
+    except Exception as exc:
+        summary["sample_error"] = repr(exc)
+    try:
+        work = x.detach().float()
+        finite = torch.isfinite(work)
+        summary["finite"] = bool(finite.all().detach().cpu().item())
+        if work.numel() > 0 and bool(finite.any().detach().cpu().item()):
+            finite_values = work[finite]
+            summary["min"] = float(finite_values.min().detach().cpu().item())
+            summary["max"] = float(finite_values.max().detach().cpu().item())
+            summary["mean"] = float(finite_values.mean().detach().cpu().item())
+    except Exception as exc:
+        summary["stats_error"] = repr(exc)
+    return summary
+
+
+def _dense_cache_trace_topk(logits: Optional[torch.Tensor]):
+    if not isinstance(logits, torch.Tensor) or logits.numel() == 0:
+        return None
+    limit = min(max(1, _dense_cache_trace_value_limit(20)), int(logits.shape[-1]))
+    try:
+        rows = logits.detach()
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(0)
+        values, indices = torch.topk(rows.float(), k=limit, dim=-1)
+        return {
+            "indices": indices.to("cpu").tolist(),
+            "values": values.to("cpu").tolist(),
+        }
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
+def _trace_dense_cache_logits(
+    *,
+    label: str,
+    logits_metadata: "LogitsMetadata",
+    tensor: Optional[torch.Tensor],
+    sample_indices: Optional[torch.Tensor] = None,
+):
+    if not _fp4_kv_dense_cache_trace_enabled():
+        return
+    logger.warning(
+        "FP4 KV dense-cache logits trace %s",
+        {
+            "label": label,
+            "mode": repr(getattr(logits_metadata, "forward_mode", None)),
+            "extend_return_logprob": getattr(
+                logits_metadata, "extend_return_logprob", None
+            ),
+            "extend_seq_lens_cpu": getattr(logits_metadata, "extend_seq_lens_cpu", None),
+            "sample_indices": _dense_cache_trace_tensor(sample_indices),
+            "tensor": _dense_cache_trace_tensor(tensor),
+            "topk": _dense_cache_trace_topk(tensor),
+        },
+    )
+
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -353,6 +443,12 @@ class LogitsProcessor(nn.Module):
             aux_hidden_states,
             logits_metadata,
         )
+        _trace_dense_cache_logits(
+            label="pruned_states",
+            logits_metadata=logits_metadata,
+            tensor=pruned_states,
+            sample_indices=sample_indices,
+        )
 
         hidden_states_to_store = self._get_hidden_states_to_store(
             hidden_states,
@@ -369,8 +465,20 @@ class LogitsProcessor(nn.Module):
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            _trace_dense_cache_logits(
+                label="raw_logits",
+                logits_metadata=logits_metadata,
+                tensor=logits,
+                sample_indices=sample_indices,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
+            )
+            _trace_dense_cache_logits(
+                label="sampled_logits",
+                logits_metadata=logits_metadata,
+                tensor=sampled_logits,
+                sample_indices=sample_indices,
             )
 
             # Decode mode or extend mode without return_logprob.
@@ -398,8 +506,20 @@ class LogitsProcessor(nn.Module):
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            _trace_dense_cache_logits(
+                label="raw_logits_return_logprob",
+                logits_metadata=logits_metadata,
+                tensor=logits,
+                sample_indices=sample_indices,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
+            )
+            _trace_dense_cache_logits(
+                label="sampled_logits_return_logprob",
+                logits_metadata=logits_metadata,
+                tensor=sampled_logits,
+                sample_indices=sample_indices,
             )
             input_logits = logits[input_logprob_indices]
             del logits
