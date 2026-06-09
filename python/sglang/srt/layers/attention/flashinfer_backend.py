@@ -91,6 +91,10 @@ def _trace_k_scale_multipliers() -> List[float]:
     return values[:16]
 
 
+def _trace_k_head_scale_policy_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_K_HEAD_SCALE_POLICY") == "1"
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -313,6 +317,21 @@ def _scale_trace_value(x):
                 return float(x.detach().float().cpu().item())
             return _tensor_trace_summary(x)
         return float(x)
+    except Exception:
+        return repr(x)
+
+
+def _float_tensor_trace_values(x: torch.Tensor, limit: int = 32):
+    try:
+        flat = x.detach().float().reshape(-1).cpu()
+        values = [float(v) for v in flat[:limit]]
+        return {
+            "count": int(flat.numel()),
+            "values": values,
+            "truncated": int(flat.numel()) > limit,
+            "min": float(flat.min().item()) if flat.numel() else None,
+            "max": float(flat.max().item()) if flat.numel() else None,
+        }
     except Exception:
         return repr(x)
 
@@ -1135,6 +1154,8 @@ class FlashInferAttnBackend(AttentionBackend):
             return
         try:
             from sglang.srt.layers.quantization.kvfp4_tensor import (
+                E2M1_MAX,
+                MAX_BLOCK_SCALE_FP8,
                 NVFP4KVQuantizeUtil,
             )
 
@@ -1179,6 +1200,58 @@ class FlashInferAttnBackend(AttentionBackend):
                         "k_deq": alt_k_deq,
                     }
                 )
+            k_head_scale_policy_refs = []
+            if _trace_k_head_scale_policy_enabled():
+                denom = E2M1_MAX * MAX_BLOCK_SCALE_FP8
+                head_amax = k3.detach().abs().amax(dim=(0, 2)).float()
+                base_k_global = k_global.float().reshape(1).contiguous()
+                head_multipliers = _trace_k_scale_multipliers() or [1.0]
+                for multiplier in head_multipliers[:16]:
+                    head_globals = (head_amax / denom * multiplier).clamp(min=1e-8)
+                    head_chunks = []
+                    ratio_values = []
+                    sf_before_values = []
+                    sf_after_values = []
+                    for head_id in range(k3.shape[1]):
+                        head_global = head_globals[head_id : head_id + 1].contiguous()
+                        head_fp4, head_sf, _ = NVFP4KVQuantizeUtil.quantize(
+                            k3[:, head_id : head_id + 1, :].contiguous(),
+                            head_global,
+                        )
+                        # FlashInfer's paged attention receives a single global scale.
+                        # This simulates carrying per-head effective globals by folding
+                        # the ratio into the stored FP8 block-scale buffer.
+                        ratio = (head_global / base_k_global).contiguous()
+                        head_sf_for_base = (head_sf.float() * ratio).to(
+                            torch.float8_e4m3fn
+                        )
+                        head_deq = NVFP4KVQuantizeUtil.dequantize(
+                            head_fp4.view(torch.uint8),
+                            head_sf_for_base.reshape(k3.shape[0], -1),
+                            base_k_global,
+                            dtype=k3.dtype,
+                        ).view(k3.shape[0], 1, k3.shape[2])
+                        head_chunks.append(head_deq)
+                        ratio_values.append(ratio.reshape(()))
+                        sf_before_values.append(head_sf.float().reshape(-1))
+                        sf_after_values.append(head_sf_for_base.float().reshape(-1))
+                    k_head_scale_policy_refs.append(
+                        {
+                            "policy": "per_kv_head_amax_folded_sf",
+                            "multiplier": multiplier,
+                            "k_globals": _float_tensor_trace_values(head_globals),
+                            "global_to_base_ratios": _float_tensor_trace_values(
+                                torch.stack(ratio_values)
+                            ),
+                            "sf_before": _float_tensor_trace_values(
+                                torch.cat(sf_before_values)
+                            ),
+                            "sf_after": _float_tensor_trace_values(
+                                torch.cat(sf_after_values)
+                            ),
+                            "k_deq": torch.cat(head_chunks, dim=1),
+                        }
+                    )
 
             sample_rows = _trace_sample_rows(forward_batch, int(o3.shape[0]))
             head_repeat = layer.tp_q_head_num // layer.tp_k_head_num
@@ -1234,6 +1307,33 @@ class FlashInferAttnBackend(AttentionBackend):
                             ),
                         }
                     )
+                head_policy_rows = []
+                for policy in k_head_scale_policy_refs:
+                    policy_k_deq = policy["k_deq"]
+                    policy_fp4_ref = attention_ref(policy_k_deq, v_deq, row_id)
+                    policy_fp4_k_ref = attention_ref(policy_k_deq, v3, row_id)
+                    head_policy_rows.append(
+                        {
+                            "policy": policy["policy"],
+                            "multiplier": policy["multiplier"],
+                            "k_globals": policy["k_globals"],
+                            "global_to_base_ratios": policy["global_to_base_ratios"],
+                            "sf_before": policy["sf_before"],
+                            "sf_after": policy["sf_after"],
+                            "k_dequant_prefix_vs_bf16_prefix": (
+                                _trace_compare_tensors(
+                                    policy_k_deq[: row_id + 1],
+                                    k3[: row_id + 1],
+                                )
+                            ),
+                            "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
+                                policy_fp4_ref, bf16_ref
+                            ),
+                            "fp4_k_only_ref_vs_bf16_ref": (
+                                _trace_compare_tensors(policy_fp4_k_ref, bf16_ref)
+                            ),
+                        }
+                    )
                 actual = o3[row_id]
                 row_record = {
                     "row": row_id,
@@ -1258,6 +1358,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 }
                 if multiplier_rows:
                     row_record["k_scale_multiplier_refs"] = multiplier_rows
+                if head_policy_rows:
+                    row_record["k_head_scale_policy_refs"] = head_policy_rows
                 rows.append(row_record)
 
             if rows:
