@@ -384,6 +384,21 @@ def _dense_cache_trace_topk(logits: Optional[torch.Tensor]):
         return {"error": repr(exc)}
 
 
+def _dense_cache_trace_sample_rows(x: Optional[torch.Tensor]):
+    if not isinstance(x, torch.Tensor) or x.numel() == 0:
+        return []
+    try:
+        rows = x.detach()
+        row_count = 1 if rows.dim() == 1 else int(rows.shape[0])
+        if row_count <= 0:
+            return []
+        if row_count == 1:
+            return [0]
+        return sorted({0, row_count - 1})
+    except Exception:
+        return []
+
+
 def _dense_cache_trace_cpu_list(value):
     if value is None:
         return None
@@ -433,6 +448,7 @@ def _trace_dense_cache_sample_boundary(
             "seq_lens_cpu": _dense_cache_trace_cpu_list(
                 getattr(forward_batch, "seq_lens_cpu", None)
             ),
+            "sample_rows": _dense_cache_trace_sample_rows(logits),
             "next_token_logits": _dense_cache_trace_tensor(logits),
             "topk": _dense_cache_trace_topk(logits),
         },
