@@ -1115,16 +1115,6 @@ class FlashInferAttnBackend(AttentionBackend):
             or not _trace_layer_enabled(int(layer.layer_id))
         ):
             return
-        if logits_soft_cap is not None:
-            logger.warning(
-                "FP4 KV dense-quant attention trace skipped %s",
-                {
-                    "layer": int(layer.layer_id),
-                    "reason": "logits_soft_cap reference path is not implemented",
-                },
-            )
-            return
-
         try:
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 NVFP4KVQuantizeUtil,
@@ -1168,6 +1158,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_rep = k_prefix.repeat_interleave(head_repeat, dim=1)
                 v_rep = v_prefix.repeat_interleave(head_repeat, dim=1)
                 scores = torch.einsum("hd,thd->ht", q_row, k_rep) * sm_scale
+                if logits_soft_cap is not None and float(logits_soft_cap) > 0:
+                    scores = float(logits_soft_cap) * torch.tanh(
+                        scores / float(logits_soft_cap)
+                    )
                 probs = torch.softmax(scores, dim=-1)
                 return torch.einsum("ht,thd->hd", probs, v_rep).to(o3.dtype)
 
@@ -1212,6 +1206,9 @@ class FlashInferAttnBackend(AttentionBackend):
                         "sample_rows": sample_rows,
                         "k_global": _scale_trace_value(k_global),
                         "v_global": _scale_trace_value(v_global),
+                        "logits_soft_cap": (
+                            None if logits_soft_cap is None else float(logits_soft_cap)
+                        ),
                         "rows": rows,
                     },
                 )
