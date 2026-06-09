@@ -128,6 +128,21 @@ def _dense_cache_trace_topk(logits: Optional[torch.Tensor]):
         return {"error": repr(exc)}
 
 
+def _dense_cache_trace_sample_rows(x: Optional[torch.Tensor]):
+    if not isinstance(x, torch.Tensor) or x.numel() == 0:
+        return []
+    try:
+        rows = x.detach()
+        row_count = 1 if rows.dim() == 1 else int(rows.shape[0])
+        if row_count <= 0:
+            return []
+        if row_count == 1:
+            return [0]
+        return sorted({0, row_count - 1})
+    except Exception:
+        return []
+
+
 def _trace_dense_cache_logits(
     *,
     label: str,
@@ -153,6 +168,7 @@ def _trace_dense_cache_logits(
                 logits_metadata, "extend_prefix_lens_cpu", None
             ),
             "extend_seq_lens_cpu": getattr(logits_metadata, "extend_seq_lens_cpu", None),
+            "sample_rows": _dense_cache_trace_sample_rows(tensor),
             "sample_indices": _dense_cache_trace_tensor(sample_indices),
             "tensor": _dense_cache_trace_tensor(tensor),
             "topk": _dense_cache_trace_topk(tensor),
