@@ -314,6 +314,101 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _fp4_kv_dense_cache_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
+
+
+def _dense_cache_trace_value_limit(default: int = 8) -> int:
+    raw = os.environ.get("SGLANG_FP4_KV_TRACE_VALUES")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _dense_cache_trace_tensor(x: Optional[torch.Tensor], limit: Optional[int] = None):
+    if x is None:
+        return None
+    if not isinstance(x, torch.Tensor):
+        return repr(x)
+    if limit is None:
+        limit = _dense_cache_trace_value_limit()
+    summary = {
+        "shape": tuple(x.shape),
+        "dtype": str(x.dtype),
+        "stride": tuple(x.stride()),
+        "device": str(x.device),
+    }
+    try:
+        flat = x.detach().flatten()
+        summary["sample"] = flat[:limit].to("cpu").tolist()
+    except Exception as exc:
+        summary["sample_error"] = repr(exc)
+    try:
+        work = x.detach().float()
+        finite = torch.isfinite(work)
+        summary["finite"] = bool(finite.all().detach().cpu().item())
+        if work.numel() > 0 and bool(finite.any().detach().cpu().item()):
+            finite_values = work[finite]
+            summary["min"] = float(finite_values.min().detach().cpu().item())
+            summary["max"] = float(finite_values.max().detach().cpu().item())
+            summary["mean"] = float(finite_values.mean().detach().cpu().item())
+    except Exception as exc:
+        summary["stats_error"] = repr(exc)
+    return summary
+
+
+def _dense_cache_trace_topk(logits: Optional[torch.Tensor]):
+    if not isinstance(logits, torch.Tensor) or logits.numel() == 0:
+        return None
+    limit = min(max(1, _dense_cache_trace_value_limit(20)), int(logits.shape[-1]))
+    try:
+        rows = logits.detach()
+        if rows.dim() == 1:
+            rows = rows.unsqueeze(0)
+        values, indices = torch.topk(rows.float(), k=limit, dim=-1)
+        return {
+            "indices": indices.to("cpu").tolist(),
+            "values": values.to("cpu").tolist(),
+        }
+    except Exception as exc:
+        return {"error": repr(exc)}
+
+
+def _trace_dense_cache_sample_boundary(
+    *,
+    label: str,
+    logits_output: LogitsProcessorOutput,
+    forward_batch: ForwardBatch,
+):
+    if not _fp4_kv_dense_cache_trace_enabled():
+        return
+    rids = getattr(forward_batch, "rids", None)
+    if rids is not None:
+        rids = [str(rid) for rid in rids]
+    rid_filter = os.environ.get("SGLANG_FP4_KV_TRACE_RID")
+    if rid_filter not in (None, "") and (rids is None or rid_filter not in rids):
+        return
+    logits = getattr(logits_output, "next_token_logits", None)
+    logger.warning(
+        "FP4 KV dense-cache sampler trace %s",
+        {
+            "label": label,
+            "rids": rids,
+            "mode": repr(getattr(forward_batch, "forward_mode", None)),
+            "extend_prefix_lens_cpu": getattr(
+                forward_batch, "extend_prefix_lens_cpu", None
+            ),
+            "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
+            "seq_lens_cpu": getattr(forward_batch, "seq_lens_cpu", None),
+            "next_token_logits": _dense_cache_trace_tensor(logits),
+            "topk": _dense_cache_trace_topk(logits),
+        },
+    )
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -3920,7 +4015,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+        _trace_dense_cache_sample_boundary(
+            label="before_preprocess_logits",
+            logits_output=logits_output,
+            forward_batch=forward_batch,
+        )
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        _trace_dense_cache_sample_boundary(
+            label="after_preprocess_logits",
+            logits_output=logits_output,
+            forward_batch=forward_batch,
+        )
 
         # Sample the next tokens
         next_token_ids = self.sampler(
