@@ -69,6 +69,10 @@ def _fp4_kv_dense_cache_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
 
 
+def _fp4_kv_dense_quant_attention_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_QUANT_ATTENTION") == "1"
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -1092,6 +1096,132 @@ class FlashInferAttnBackend(AttentionBackend):
             summary["v_scale"] = _scale_trace_value(paged_kv_kwargs.get("v_scale"))
         logger.warning("FP4 KV dense-cache attention trace %s", summary)
 
+    def _trace_nvfp4_dense_quant_attention_loss(
+        self,
+        *,
+        label: str,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        o: torch.Tensor,
+        sm_scale: float,
+        logits_soft_cap: Optional[float],
+    ):
+        if (
+            not self.is_nvfp4_native
+            or not _fp4_kv_dense_quant_attention_trace_enabled()
+            or not _trace_layer_enabled(int(layer.layer_id))
+        ):
+            return
+        if logits_soft_cap is not None:
+            logger.warning(
+                "FP4 KV dense-quant attention trace skipped %s",
+                {
+                    "layer": int(layer.layer_id),
+                    "reason": "logits_soft_cap reference path is not implemented",
+                },
+            )
+            return
+
+        try:
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                NVFP4KVQuantizeUtil,
+            )
+
+            k_global, v_global = self.token_to_kv_pool._get_kv_global_scale_tensor(
+                layer.layer_id
+            )
+            q3 = q.view(-1, layer.tp_q_head_num, layer.head_dim).contiguous()
+            k3 = k.view(-1, layer.tp_k_head_num, layer.head_dim).contiguous()
+            v3 = v.view(-1, layer.tp_v_head_num, layer.head_dim).contiguous()
+            o3 = o.view(-1, layer.tp_q_head_num, layer.head_dim).contiguous()
+
+            k_fp4, k_sf, _ = NVFP4KVQuantizeUtil.quantize(k3, k_global)
+            v_fp4, v_sf, _ = NVFP4KVQuantizeUtil.quantize(v3, v_global)
+            k_deq = NVFP4KVQuantizeUtil.dequantize(
+                k_fp4.view(torch.uint8),
+                k_sf.reshape(k3.shape[0], -1),
+                k_global,
+                dtype=k3.dtype,
+            ).view_as(k3)
+            v_deq = NVFP4KVQuantizeUtil.dequantize(
+                v_fp4.view(torch.uint8),
+                v_sf.reshape(v3.shape[0], -1),
+                v_global,
+                dtype=v3.dtype,
+            ).view_as(v3)
+
+            sample_rows = _trace_sample_rows(forward_batch, int(o3.shape[0]))
+            head_repeat = layer.tp_q_head_num // layer.tp_k_head_num
+            if head_repeat <= 0 or layer.tp_q_head_num % layer.tp_k_head_num != 0:
+                raise RuntimeError(
+                    f"unsupported GQA mapping: q_heads={layer.tp_q_head_num}, "
+                    f"kv_heads={layer.tp_k_head_num}"
+                )
+
+            def attention_ref(kv_k: torch.Tensor, kv_v: torch.Tensor, row_id: int):
+                q_row = q3[row_id].float()
+                k_prefix = kv_k[: row_id + 1].float()
+                v_prefix = kv_v[: row_id + 1].float()
+                k_rep = k_prefix.repeat_interleave(head_repeat, dim=1)
+                v_rep = v_prefix.repeat_interleave(head_repeat, dim=1)
+                scores = torch.einsum("hd,thd->ht", q_row, k_rep) * sm_scale
+                probs = torch.softmax(scores, dim=-1)
+                return torch.einsum("ht,thd->hd", probs, v_rep).to(o3.dtype)
+
+            rows = []
+            for row in sample_rows:
+                row_id = int(row)
+                if row_id < 0 or row_id >= o3.shape[0]:
+                    continue
+                bf16_ref = attention_ref(k3, v3, row_id)
+                fp4_ref = attention_ref(k_deq, v_deq, row_id)
+                actual = o3[row_id]
+                rows.append(
+                    {
+                        "row": row_id,
+                        "actual_vs_bf16_ref": _trace_compare_tensors(
+                            actual, bf16_ref
+                        ),
+                        "actual_vs_fp4_ref": _trace_compare_tensors(
+                            actual, fp4_ref
+                        ),
+                        "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
+                            fp4_ref, bf16_ref
+                        ),
+                        "actual": _trace_numeric_tensor_stats(actual),
+                        "bf16_ref": _trace_numeric_tensor_stats(bf16_ref),
+                        "fp4_ref": _trace_numeric_tensor_stats(fp4_ref),
+                    }
+                )
+
+            if rows:
+                logger.warning(
+                    "FP4 KV dense-quant attention trace %s",
+                    {
+                        "kind": "dense_quant_attention",
+                        "label": label,
+                        "layer": int(layer.layer_id),
+                        "forward_pass_id": getattr(
+                            forward_batch, "forward_pass_id", None
+                        ),
+                        "rids": _trace_rids(forward_batch),
+                        "mode": repr(getattr(forward_batch, "forward_mode", None)),
+                        "sample_rows": sample_rows,
+                        "k_global": _scale_trace_value(k_global),
+                        "v_global": _scale_trace_value(v_global),
+                        "rows": rows,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "FP4 KV dense-quant attention trace failed layer=%s error=%r",
+                int(layer.layer_id),
+                exc,
+            )
+
     def _trace_nvfp4_prefix_reference(
         self,
         *,
@@ -1995,6 +2125,24 @@ class FlashInferAttnBackend(AttentionBackend):
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+            if (
+                self.is_nvfp4_native
+                and self.forward_metadata.use_ragged
+                and self.forward_metadata.extend_no_prefix
+                and k is not None
+                and v is not None
+            ):
+                self._trace_nvfp4_dense_quant_attention_loss(
+                    label="forward_extend_ragged_no_prefix",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    q=q,
+                    k=k,
+                    v=v,
+                    o=o,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
