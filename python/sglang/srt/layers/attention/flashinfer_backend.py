@@ -1118,8 +1118,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         wrapper_id = int(self._get_wrapper_idx(layer))
         summary = {
+            "kind": "attention",
             "label": label,
             "layer": int(layer.layer_id),
+            "forward_pass_id": getattr(forward_batch, "forward_pass_id", None),
             "wrapper_id": wrapper_id,
             "rids": rids,
             "mode": repr(getattr(forward_batch, "forward_mode", None)),

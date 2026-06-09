@@ -140,10 +140,17 @@ def _trace_dense_cache_logits(
     logger.warning(
         "FP4 KV dense-cache logits trace %s",
         {
+            "kind": "logits",
             "label": label,
+            "layer": None,
+            "forward_pass_id": getattr(logits_metadata, "forward_pass_id", None),
+            "rids": getattr(logits_metadata, "rids", None),
             "mode": repr(getattr(logits_metadata, "forward_mode", None)),
             "extend_return_logprob": getattr(
                 logits_metadata, "extend_return_logprob", None
+            ),
+            "extend_prefix_lens_cpu": getattr(
+                logits_metadata, "extend_prefix_lens_cpu", None
             ),
             "extend_seq_lens_cpu": getattr(logits_metadata, "extend_seq_lens_cpu", None),
             "sample_indices": _dense_cache_trace_tensor(sample_indices),
@@ -234,6 +241,7 @@ class LogitsMetadata:
     extend_token_ids_logprob: bool = False
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
@@ -263,6 +271,8 @@ class LogitsMetadata:
     is_prefill_only: bool = False
 
     mm_input_embeds: Optional[torch.Tensor] = None
+    rids: Optional[List[str]] = None
+    forward_pass_id: Optional[int] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -300,6 +310,9 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=getattr(
+                forward_batch, "extend_prefix_lens_cpu", None
+            ),
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
@@ -315,6 +328,12 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            rids=(
+                [str(rid) for rid in forward_batch.rids]
+                if getattr(forward_batch, "rids", None) is not None
+                else None
+            ),
+            forward_pass_id=getattr(forward_batch, "forward_pass_id", None),
         )
 
     def compute_dp_attention_metadata(self):

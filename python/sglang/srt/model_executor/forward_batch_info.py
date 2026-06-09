@@ -482,6 +482,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+    forward_pass_id: Optional[int] = None
 
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
