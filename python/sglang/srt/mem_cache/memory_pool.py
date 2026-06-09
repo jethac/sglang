@@ -99,6 +99,17 @@ def _fp4_kv_trace_quant_error_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_QUANT_ERROR") == "1"
 
 
+def _fp4_kv_k_global_scale_multiplier() -> float:
+    raw = os.environ.get("SGLANG_FP4_KV_K_GLOBAL_SCALE_MULTIPLIER")
+    if raw in (None, ""):
+        return 1.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1.0
+    return value if value > 0 else 1.0
+
+
 def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -1969,6 +1980,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_amax = cache_v.detach().abs().amax().float()
         k_gs = (k_amax / denom).clamp_(min=1e-8)
         v_gs = (v_amax / denom).clamp_(min=1e-8)
+        k_gs_multiplier = _fp4_kv_k_global_scale_multiplier()
+        if k_gs_multiplier != 1.0:
+            k_gs = (k_gs * k_gs_multiplier).clamp_(min=1e-8)
         self.k_global[local_layer_id].copy_(k_gs)
         self.v_global[local_layer_id].copy_(v_gs)
         self.k_global_float[local_layer_id] = float(k_gs)
@@ -1977,12 +1991,13 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         if not explicit_autocalib:
             logger.info(
                 "NVFP4 KV auto-calibrated layer %d: k_amax=%.4g v_amax=%.4g "
-                "k_gs=%.4g v_gs=%.4g (n_tokens=%d)",
+                "k_gs=%.4g v_gs=%.4g k_gs_multiplier=%.4g (n_tokens=%d)",
                 layer_id,
                 float(k_amax),
                 float(v_amax),
                 self.k_global_float[local_layer_id],
                 self.v_global_float[local_layer_id],
+                k_gs_multiplier,
                 cache_k.shape[0],
             )
 
