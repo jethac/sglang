@@ -183,8 +183,10 @@ def _trace_qwen2_dense_cache_state(
     logger.warning(
         "FP4 KV dense-cache Qwen2 trace %s",
         {
+            "kind": "qwen2",
             "label": label,
             "layer": layer_id,
+            "forward_pass_id": getattr(forward_batch, "forward_pass_id", None),
             "rids": rids,
             "mode": repr(getattr(forward_batch, "forward_mode", None)),
             "extend_prefix_lens_cpu": getattr(

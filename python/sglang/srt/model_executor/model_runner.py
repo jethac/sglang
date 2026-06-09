@@ -377,6 +377,22 @@ def _dense_cache_trace_topk(logits: Optional[torch.Tensor]):
         return {"error": repr(exc)}
 
 
+def _dense_cache_trace_cpu_list(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        try:
+            return value.detach().to("cpu").tolist()
+        except Exception as exc:
+            return {"error": repr(exc)}
+    if isinstance(value, (list, tuple)):
+        return [
+            item.detach().to("cpu").tolist() if isinstance(item, torch.Tensor) else item
+            for item in value
+        ]
+    return value
+
+
 def _trace_dense_cache_sample_boundary(
     *,
     label: str,
@@ -395,14 +411,21 @@ def _trace_dense_cache_sample_boundary(
     logger.warning(
         "FP4 KV dense-cache sampler trace %s",
         {
+            "kind": "sampler",
             "label": label,
+            "layer": None,
+            "forward_pass_id": getattr(forward_batch, "forward_pass_id", None),
             "rids": rids,
             "mode": repr(getattr(forward_batch, "forward_mode", None)),
-            "extend_prefix_lens_cpu": getattr(
-                forward_batch, "extend_prefix_lens_cpu", None
+            "extend_prefix_lens_cpu": _dense_cache_trace_cpu_list(
+                getattr(forward_batch, "extend_prefix_lens_cpu", None)
             ),
-            "extend_seq_lens_cpu": getattr(forward_batch, "extend_seq_lens_cpu", None),
-            "seq_lens_cpu": getattr(forward_batch, "seq_lens_cpu", None),
+            "extend_seq_lens_cpu": _dense_cache_trace_cpu_list(
+                getattr(forward_batch, "extend_seq_lens_cpu", None)
+            ),
+            "seq_lens_cpu": _dense_cache_trace_cpu_list(
+                getattr(forward_batch, "seq_lens_cpu", None)
+            ),
             "next_token_logits": _dense_cache_trace_tensor(logits),
             "topk": _dense_cache_trace_topk(logits),
         },
@@ -3800,6 +3823,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        forward_batch.forward_pass_id = self.forward_pass_id
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
