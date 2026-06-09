@@ -1172,6 +1172,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     continue
                 bf16_ref = attention_ref(k3, v3, row_id)
                 fp4_ref = attention_ref(k_deq, v_deq, row_id)
+                fp4_k_ref = attention_ref(k_deq, v3, row_id)
+                fp4_v_ref = attention_ref(k3, v_deq, row_id)
                 actual = o3[row_id]
                 rows.append(
                     {
@@ -1185,9 +1187,17 @@ class FlashInferAttnBackend(AttentionBackend):
                         "fp4_ref_vs_bf16_ref": _trace_compare_tensors(
                             fp4_ref, bf16_ref
                         ),
+                        "fp4_k_only_ref_vs_bf16_ref": _trace_compare_tensors(
+                            fp4_k_ref, bf16_ref
+                        ),
+                        "fp4_v_only_ref_vs_bf16_ref": _trace_compare_tensors(
+                            fp4_v_ref, bf16_ref
+                        ),
                         "actual": _trace_numeric_tensor_stats(actual),
                         "bf16_ref": _trace_numeric_tensor_stats(bf16_ref),
                         "fp4_ref": _trace_numeric_tensor_stats(fp4_ref),
+                        "fp4_k_only_ref": _trace_numeric_tensor_stats(fp4_k_ref),
+                        "fp4_v_only_ref": _trace_numeric_tensor_stats(fp4_v_ref),
                     }
                 )
 
