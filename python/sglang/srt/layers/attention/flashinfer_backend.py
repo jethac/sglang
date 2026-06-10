@@ -73,6 +73,10 @@ def _fp4_kv_dense_quant_attention_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_QUANT_ATTENTION") == "1"
 
 
+def _fp4_kv_module_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_MODULE") == "1"
+
+
 def _trace_k_scale_multipliers() -> List[float]:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_K_SCALE_MULTIPLIERS")
     if raw in (None, ""):
@@ -123,6 +127,16 @@ def _trace_token_limit(default: int = 128) -> int:
         return default
 
 
+def _trace_q_row_limit(default: Optional[int] = None) -> Optional[int]:
+    raw = os.environ.get("SGLANG_FP4_KV_PREFIX_REF_MAX_Q_ROWS")
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
 def _trace_cpu_values(value):
     if value is None:
         return None
@@ -157,6 +171,65 @@ def _trace_tensor_values(value, limit: int = 8):
             "tail": values[-limit:] if values else [],
         }
     return values
+
+
+def _trace_simple_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
+    if isinstance(value, torch.Tensor):
+        return _tensor_trace_summary(value)
+    if isinstance(value, (list, tuple)):
+        if len(value) > 8:
+            return f"{type(value).__name__}(len={len(value)})"
+        return [_trace_simple_value(item) for item in value]
+    if isinstance(value, dict):
+        if len(value) > 16:
+            return f"dict(len={len(value)})"
+        return {str(k): _trace_simple_value(v) for k, v in value.items()}
+    if callable(value):
+        return f"callable:{getattr(value, '__name__', type(value).__name__)}"
+    text = repr(value)
+    if len(text) > 240:
+        text = text[:240] + "..."
+    return text
+
+
+def _flashinfer_wrapper_trace_summary(wrapper) -> dict:
+    interesting = {}
+    for name in sorted(dir(wrapper)):
+        if name.startswith("__"):
+            continue
+        lower = name.lower()
+        if not any(
+            marker in lower
+            for marker in (
+                "backend",
+                "cache",
+                "dtype",
+                "jit",
+                "kv",
+                "module",
+                "paged",
+                "plan",
+                "uri",
+            )
+        ):
+            continue
+        try:
+            value = getattr(wrapper, name)
+        except Exception as exc:
+            interesting[name] = f"error:{exc!r}"
+            continue
+        if callable(value) and not (
+            "cache" in lower or "module" in lower or "plan" in lower
+        ):
+            continue
+        interesting[name] = _trace_simple_value(value)
+    return {"class": type(wrapper).__name__, "state": interesting}
 
 
 def _trace_rids(forward_batch: ForwardBatch):
@@ -277,6 +350,18 @@ def _is_nvfp4_native_kv_pool(token_to_kv_pool) -> bool:
     )
 
 
+def _is_fp8_k_nvfp4_v_pool(token_to_kv_pool) -> bool:
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolFP4):
+        return bool(getattr(token_to_kv_pool, "mixed_fp8_k_nvfp4_v", False))
+    return (
+        isinstance(token_to_kv_pool, SWAKVPool)
+        and bool(
+            getattr(token_to_kv_pool.full_kv_pool, "mixed_fp8_k_nvfp4_v", False)
+        )
+        and bool(getattr(token_to_kv_pool.swa_kv_pool, "mixed_fp8_k_nvfp4_v", False))
+    )
+
+
 def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
     if not isinstance(token_to_kv_pool, SWAKVPool):
         return token_to_kv_pool, layer_id
@@ -291,7 +376,9 @@ def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
     return inner_pool, local_layer_id
 
 
-def _shape_nvfp4_kv_scale_for_flashinfer(scale: torch.Tensor) -> torch.Tensor:
+def _shape_nvfp4_kv_scale_for_flashinfer(scale: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if scale is None:
+        return None
     if scale.dim() == 3:
         return scale.unsqueeze(1)
     return scale
@@ -601,6 +688,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_nvfp4_native = _is_nvfp4_native_kv_pool(
             self.token_to_kv_pool
         ) and is_sm120_supported()
+        self.is_fp8_k_nvfp4_v = self.is_nvfp4_native and _is_fp8_k_nvfp4_v_pool(
+            self.token_to_kv_pool
+        )
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -617,6 +707,12 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         if self.is_nvfp4_native:
             self.decode_use_tensor_cores = True
+        if self.is_fp8_k_nvfp4_v:
+            logger.warning(
+                "SGLang FP4 KV mixed mode enabled: K cache uses FP8 e4m3, "
+                "V cache uses packed NVFP4. Capacity claims must use the "
+                "mixed-KV denominator, not full NVFP4 K+V."
+            )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -778,6 +874,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_merge_state_trace_seen = set()
         self._nvfp4_prefix_ref_trace_seen = set()
         self._nvfp4_dense_cache_trace_seen = set()
+        self._nvfp4_module_trace_seen = set()
         self._nvfp4_last_paged_plan = {}
         self._nvfp4_last_paged_plan_tensors = {}
         self._nvfp4_dense_reference_by_layer = {}
@@ -1412,6 +1509,8 @@ class FlashInferAttnBackend(AttentionBackend):
         label: str,
         layer: RadixAttention,
         q: torch.Tensor,
+        suffix_k: torch.Tensor,
+        suffix_v: torch.Tensor,
         paged_kv_cache,
         paged_kv_kwargs,
         o1: torch.Tensor,
@@ -1471,6 +1570,9 @@ class FlashInferAttnBackend(AttentionBackend):
             kv_end = int(kv_indptr[req_idx + 1].detach().cpu().item())
             token_limit = _trace_token_limit()
             kv_end = min(kv_end, kv_start + token_limit)
+            q_row_limit = _trace_q_row_limit()
+            if q_row_limit is not None:
+                qo_end = min(qo_end, qo_start + q_row_limit)
             q_req = q[qo_start:qo_end].float()
             prefix_slots = kv_indices[kv_start:kv_end]
             summary.update(
@@ -1480,6 +1582,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     "kv_range": [kv_start, kv_end],
                     "prefix_slots": _trace_tensor_values(prefix_slots),
                     "token_limit": token_limit,
+                    "q_row_limit": q_row_limit,
                 }
             )
             if q_req.numel() == 0 or prefix_slots.numel() == 0:
@@ -1489,9 +1592,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
             k_cache, v_cache = paged_kv_cache
             k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
-            if not all(
-                isinstance(x, torch.Tensor) for x in (k_cache, v_cache, k_sf, v_sf)
-            ):
+            if not all(isinstance(x, torch.Tensor) for x in (k_cache, v_cache, v_sf)):
                 summary["error"] = "missing tensor cache or scale views"
                 summary["cache"] = _tensor_trace_summary(paged_kv_cache)
                 summary["scale"] = _tensor_trace_summary((k_sf, v_sf))
@@ -1500,27 +1601,35 @@ class FlashInferAttnBackend(AttentionBackend):
 
             k_packed = k_cache[prefix_slots]
             v_packed = v_cache[prefix_slots]
-            k_scale = k_sf[prefix_slots]
+            k_scale = k_sf[prefix_slots] if isinstance(k_sf, torch.Tensor) else None
             v_scale = v_sf[prefix_slots]
-            if k_scale.dim() == 4 and k_scale.shape[1] == 1:
+            if k_scale is not None and k_scale.dim() == 4 and k_scale.shape[1] == 1:
                 k_scale = k_scale[:, 0]
             if v_scale.dim() == 4 and v_scale.shape[1] == 1:
                 v_scale = v_scale[:, 0]
-            k_scale = k_scale.view(torch.float8_e4m3fn)
+            if k_scale is not None:
+                k_scale = k_scale.view(torch.float8_e4m3fn)
             v_scale = v_scale.view(torch.float8_e4m3fn)
-            k_scale_for_dequant = k_scale.reshape(k_scale.shape[0], -1)
+            k_scale_for_dequant = (
+                k_scale.reshape(k_scale.shape[0], -1)
+                if k_scale is not None
+                else None
+            )
             v_scale_for_dequant = v_scale.reshape(v_scale.shape[0], -1)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 NVFP4KVQuantizeUtil,
             )
 
-            k_ref = NVFP4KVQuantizeUtil.dequantize(
-                k_packed.view(torch.uint8),
-                k_scale_for_dequant,
-                paged_kv_kwargs["k_scale"],
-                dtype=torch.float32,
-            ).float()
+            if k_scale_for_dequant is None:
+                k_ref = k_packed.float()
+            else:
+                k_ref = NVFP4KVQuantizeUtil.dequantize(
+                    k_packed.view(torch.uint8),
+                    k_scale_for_dequant,
+                    paged_kv_kwargs["k_scale"],
+                    dtype=torch.float32,
+                ).float()
             v_ref = NVFP4KVQuantizeUtil.dequantize(
                 v_packed.view(torch.uint8),
                 v_scale_for_dequant,
@@ -1600,6 +1709,176 @@ class FlashInferAttnBackend(AttentionBackend):
                     "s1": _tensor_trace_summary(s1),
                     "s2": _tensor_trace_summary(s2),
                 }
+
+            suffix_k_req_raw = suffix_k.view(
+                -1, layer.tp_k_head_num, layer.head_dim
+            )[qo_start:qo_end].contiguous()
+            suffix_v_req_raw = suffix_v.view(
+                -1, layer.tp_v_head_num, layer.head_dim
+            )[qo_start:qo_end].contiguous()
+            suffix_k_req = suffix_k_req_raw.float()
+            suffix_v_req = suffix_v_req_raw.float()
+
+            def attention_ref_for_q(
+                kv_k: torch.Tensor,
+                kv_v: torch.Tensor,
+                q_rows: torch.Tensor,
+            ):
+                if kv_k.shape[0] == 0:
+                    out = torch.zeros_like(q_rows)
+                    lse = torch.full(
+                        q_rows.shape[:2],
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=q_rows.device,
+                    )
+                    return out, lse
+                q_heads_ref = q_rows.shape[1]
+                kv_heads_ref = kv_k.shape[1]
+                kv_head_for_q_ref = torch.arange(
+                    q_heads_ref, device=q_rows.device
+                ) // (q_heads_ref // kv_heads_ref)
+                k_for_q_ref = kv_k[:, kv_head_for_q_ref, :]
+                v_for_q_ref = kv_v[:, kv_head_for_q_ref, :]
+                logits_ref = (
+                    torch.einsum("qhd,thd->qht", q_rows, k_for_q_ref)
+                    * float(sm_scale)
+                )
+                if logits_soft_cap is not None and float(logits_soft_cap) > 0:
+                    logits_ref = float(logits_soft_cap) * torch.tanh(
+                        logits_ref / float(logits_soft_cap)
+                    )
+                lse_ref_local = torch.logsumexp(logits_ref, dim=-1)
+                probs_ref = torch.softmax(logits_ref, dim=-1)
+                out_ref = torch.einsum("qht,thd->qhd", probs_ref, v_for_q_ref)
+                return out_ref, lse_ref_local
+
+            def causal_suffix_ref(
+                kv_k: torch.Tensor,
+                kv_v: torch.Tensor,
+                q_rows: torch.Tensor,
+            ):
+                outs = []
+                lses = []
+                for row_idx in range(q_rows.shape[0]):
+                    out_i, lse_i = attention_ref_for_q(
+                        kv_k[: row_idx + 1],
+                        kv_v[: row_idx + 1],
+                        q_rows[row_idx : row_idx + 1],
+                    )
+                    outs.append(out_i)
+                    lses.append(lse_i)
+                return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+            def full_with_prefix_ref(
+                prefix_k: torch.Tensor,
+                prefix_v: torch.Tensor,
+                suffix_k_local: torch.Tensor,
+                suffix_v_local: torch.Tensor,
+                q_rows: torch.Tensor,
+            ):
+                outs = []
+                lses = []
+                for row_idx in range(q_rows.shape[0]):
+                    full_k = torch.cat(
+                        [prefix_k, suffix_k_local[: row_idx + 1]], dim=0
+                    )
+                    full_v = torch.cat(
+                        [prefix_v, suffix_v_local[: row_idx + 1]], dim=0
+                    )
+                    out_i, lse_i = attention_ref_for_q(
+                        full_k, full_v, q_rows[row_idx : row_idx + 1]
+                    )
+                    outs.append(out_i)
+                    lses.append(lse_i)
+                return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+            runtime_suffix_o, runtime_suffix_lse = causal_suffix_ref(
+                suffix_k_req, suffix_v_req, q_req
+            )
+            runtime_full_o, runtime_full_lse = full_with_prefix_ref(
+                k_ref.float(), v_ref.float(), suffix_k_req, suffix_v_req, q_req
+            )
+
+            from sglang.srt.layers.quantization.kvfp4_tensor import (
+                NVFP4KVQuantizeUtil as _NVFP4KVQuantizeUtilForSuffix,
+            )
+
+            suffix_k_fp4, suffix_k_sf, _ = _NVFP4KVQuantizeUtilForSuffix.quantize(
+                suffix_k_req_raw, paged_kv_kwargs["k_scale"]
+            )
+            suffix_v_fp4, suffix_v_sf, _ = _NVFP4KVQuantizeUtilForSuffix.quantize(
+                suffix_v_req_raw, paged_kv_kwargs["v_scale"]
+            )
+            suffix_k_fp4_ref = _NVFP4KVQuantizeUtilForSuffix.dequantize(
+                suffix_k_fp4.view(torch.uint8),
+                suffix_k_sf.reshape(suffix_k_req.shape[0], -1),
+                paged_kv_kwargs["k_scale"],
+                dtype=torch.float32,
+            ).view_as(suffix_k_req)
+            suffix_v_fp4_ref = _NVFP4KVQuantizeUtilForSuffix.dequantize(
+                suffix_v_fp4.view(torch.uint8),
+                suffix_v_sf.reshape(suffix_v_req.shape[0], -1),
+                paged_kv_kwargs["v_scale"],
+                dtype=torch.float32,
+            ).view_as(suffix_v_req)
+            all_fp4_suffix_o, all_fp4_suffix_lse = causal_suffix_ref(
+                suffix_k_fp4_ref, suffix_v_fp4_ref, q_req
+            )
+            all_fp4_full_o, all_fp4_full_lse = full_with_prefix_ref(
+                k_ref.float(),
+                v_ref.float(),
+                suffix_k_fp4_ref,
+                suffix_v_fp4_ref,
+                q_req,
+            )
+            runtime_suffix_lse_base2 = runtime_suffix_lse * 1.4426950408889634
+            runtime_full_lse_base2 = runtime_full_lse * 1.4426950408889634
+            all_fp4_suffix_lse_base2 = all_fp4_suffix_lse * 1.4426950408889634
+            all_fp4_full_lse_base2 = all_fp4_full_lse * 1.4426950408889634
+            summary["runtime_full_reference"] = {
+                "suffix_o_bf16_vs_o1": (
+                    _trace_compare_tensors(
+                        runtime_suffix_o.to(o1_slice.dtype), o1_slice
+                    )
+                    if isinstance(s1_slice, torch.Tensor)
+                    else {"error": "missing s1 slice"}
+                ),
+                "suffix_lse_bf16_base2_vs_s1": (
+                    _trace_compare_tensors(runtime_suffix_lse_base2, s1_slice)
+                    if isinstance(s1_slice, torch.Tensor)
+                    else {"error": "missing s1 slice"}
+                ),
+                "suffix_lse_bf16_natural_vs_s1": (
+                    _trace_compare_tensors(runtime_suffix_lse, s1_slice)
+                    if isinstance(s1_slice, torch.Tensor)
+                    else {"error": "missing s1 slice"}
+                ),
+                "full_prefix_fp4_suffix_bf16_vs_merged": _trace_compare_tensors(
+                    runtime_full_o.to(merged_slice.dtype), merged_slice
+                ),
+                "full_prefix_fp4_suffix_bf16_lse_base2": _trace_numeric_tensor_stats(
+                    runtime_full_lse_base2
+                ),
+                "suffix_o_fp4_vs_o1": (
+                    _trace_compare_tensors(
+                        all_fp4_suffix_o.to(o1_slice.dtype), o1_slice
+                    )
+                    if isinstance(s1_slice, torch.Tensor)
+                    else {"error": "missing s1 slice"}
+                ),
+                "suffix_lse_fp4_base2_vs_s1": (
+                    _trace_compare_tensors(all_fp4_suffix_lse_base2, s1_slice)
+                    if isinstance(s1_slice, torch.Tensor)
+                    else {"error": "missing s1 slice"}
+                ),
+                "full_prefix_fp4_suffix_fp4_vs_merged": _trace_compare_tensors(
+                    all_fp4_full_o.to(merged_slice.dtype), merged_slice
+                ),
+                "full_prefix_fp4_suffix_fp4_lse_base2": _trace_numeric_tensor_stats(
+                    all_fp4_full_lse_base2
+                ),
+            }
 
             dense_ref = self._nvfp4_dense_reference_by_layer.get(int(layer.layer_id))
             if isinstance(dense_ref, dict):
@@ -1766,6 +2045,43 @@ class FlashInferAttnBackend(AttentionBackend):
             "v_scale": v_global,
         }
 
+    def _suffix_attention_inputs(
+        self,
+        layer: RadixAttention,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        paged_kv_kwargs,
+    ):
+        if (
+            not self.is_nvfp4_native
+            or self.is_fp8_k_nvfp4_v
+            or k is None
+            or v is None
+        ):
+            if k is None or v is None:
+                return k, v, {}
+            return (
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                {},
+            )
+
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
+
+        k3 = k.view(-1, layer.tp_k_head_num, layer.head_dim).contiguous()
+        v3 = v.view(-1, layer.tp_v_head_num, layer.head_dim).contiguous()
+        k_fp4, k_sf, _ = NVFP4KVQuantizeUtil.quantize(k3, paged_kv_kwargs["k_scale"])
+        v_fp4, v_sf, _ = NVFP4KVQuantizeUtil.quantize(v3, paged_kv_kwargs["v_scale"])
+        return (
+            k_fp4.view(torch.uint8),
+            v_fp4.view(torch.uint8),
+            {
+                "kv_cache_sf": (k_sf, v_sf),
+                "k_scale": paged_kv_kwargs["k_scale"],
+                "v_scale": paged_kv_kwargs["v_scale"],
+            },
+        )
+
     def _run_paged_native(
         self,
         wrapper,
@@ -1778,6 +2094,8 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap,
         return_lse,
         paged_kv_kwargs,
+        trace_label=None,
+        trace_layer=None,
     ):
         wrapper._causal = causal
         wrapper._pos_encoding_mode = "NONE"
@@ -1787,9 +2105,32 @@ class FlashInferAttnBackend(AttentionBackend):
         wrapper._sm_scale = sm_scale
         wrapper._rope_scale = None
         wrapper._rope_theta = None
-        return wrapper.run(
+        out = wrapper.run(
             q, paged_kv_cache, return_lse=return_lse, **paged_kv_kwargs
         )
+        if self.is_nvfp4_native and _fp4_kv_module_trace_enabled():
+            layer_id = getattr(trace_layer, "layer_id", None)
+            key = (trace_label, int(layer_id) if layer_id is not None else None)
+            if key not in self._nvfp4_module_trace_seen:
+                self._nvfp4_module_trace_seen.add(key)
+                extra_flags = os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
+                k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+                logger.warning(
+                    "FP4 KV FlashInfer module trace label=%s layer=%s "
+                    "extra_cuda_flags=%r deswizzle_macro_active=%s "
+                    "wrapper=%s kv_cache=%s k_sf=%s v_sf=%s k_scale=%s v_scale=%s",
+                    trace_label,
+                    layer_id,
+                    extra_flags,
+                    "FLASHINFER_PAGED_V_SF_DESWIZZLE" in extra_flags,
+                    _flashinfer_wrapper_trace_summary(wrapper),
+                    _tensor_trace_summary(paged_kv_cache),
+                    _tensor_trace_summary(k_sf),
+                    _tensor_trace_summary(v_sf),
+                    _scale_trace_value(paged_kv_kwargs.get("k_scale")),
+                    _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+                )
+        return out
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -2272,6 +2613,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                     return_lse=False,
                     paged_kv_kwargs=paged_kv_kwargs,
+                    trace_label="extend_paged",
+                    trace_layer=layer,
                 )
                 self._trace_nvfp4_dense_cache_state(
                     label="forward_extend_paged",
@@ -2349,18 +2692,42 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
-                )
                 paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(
                     layer
                 )
+                (
+                    suffix_k_for_attention,
+                    suffix_v_for_attention,
+                    suffix_attention_kwargs,
+                ) = self._suffix_attention_inputs(
+                    layer, k, v, paged_kv_kwargs
+                )
+                q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                if suffix_attention_kwargs:
+                    self.prefill_wrapper_ragged._causal = causal
+                    self.prefill_wrapper_ragged._pos_encoding_mode = "NONE"
+                    self.prefill_wrapper_ragged._use_fp16_qk_reduction = False
+                    self.prefill_wrapper_ragged._window_left = swa_window_left
+                    self.prefill_wrapper_ragged._logits_soft_cap = logits_soft_cap
+                    self.prefill_wrapper_ragged._sm_scale = layer.scaling
+                    self.prefill_wrapper_ragged._rope_scale = None
+                    self.prefill_wrapper_ragged._rope_theta = None
+                    o1, s1 = self.prefill_wrapper_ragged.run_return_lse(
+                        q_native,
+                        suffix_k_for_attention,
+                        suffix_v_for_attention,
+                        **suffix_attention_kwargs,
+                    )
+                else:
+                    o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                        q_native,
+                        suffix_k_for_attention,
+                        suffix_v_for_attention,
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
                 if self.is_nvfp4_native:
                     self._trace_nvfp4_forward_batch(
                         label="forward_extend_merge_paged",
@@ -2368,7 +2735,6 @@ class FlashInferAttnBackend(AttentionBackend):
                         use_ragged=self.forward_metadata.use_ragged,
                         extend_no_prefix=self.forward_metadata.extend_no_prefix,
                     )
-                    q_native = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                     self._trace_nvfp4_native_call(
                         label="extend_merge_paged",
                         layer=layer,
@@ -2392,6 +2758,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         logits_soft_cap=logits_soft_cap,
                         return_lse=True,
                         paged_kv_kwargs=paged_kv_kwargs,
+                        trace_label="extend_merge_paged",
+                        trace_layer=layer,
                     )
                 else:
                     o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -2434,6 +2802,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         label="extend_merge_paged",
                         layer=layer,
                         q=q_native,
+                        suffix_k=k,
+                        suffix_v=v,
                         paged_kv_cache=paged_kv_cache,
                         paged_kv_kwargs=paged_kv_kwargs,
                         o1=o1,
@@ -2517,6 +2887,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 logits_soft_cap=layer.logit_cap,
                 return_lse=False,
                 paged_kv_kwargs=paged_kv_kwargs,
+                trace_label="decode",
+                trace_layer=layer,
             )
         else:
             o = decode_wrapper.forward(
@@ -2555,6 +2927,12 @@ class FlashInferIndicesUpdaterDecode:
         self.kv_data_type = (
             torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
         )
+        self.k_data_type = (
+            torch.float8_e4m3fn
+            if attn_backend.is_fp8_k_nvfp4_v
+            else self.kv_data_type
+        )
+        self.v_data_type = self.kv_data_type
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -2780,6 +3158,8 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.kv_data_type,
+                k_data_type=self.k_data_type,
+                v_data_type=self.v_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -2799,6 +3179,8 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.kv_data_type,
+                k_data_type=self.k_data_type,
+                v_data_type=self.v_data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -2825,6 +3207,12 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_data_type = (
             torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
         )
+        self.k_data_type = (
+            torch.float8_e4m3fn
+            if attn_backend.is_fp8_k_nvfp4_v
+            else self.kv_data_type
+        )
+        self.v_data_type = self.kv_data_type
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -3119,6 +3507,17 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            has_cached_prefix = bool(torch.any(prefix_lens[:bs] > 0).item())
+            ragged_kv_data_type = (
+                self.kv_data_type
+                if (
+                    has_cached_prefix
+                    and
+                    self.attn_backend.is_nvfp4_native
+                    and not self.attn_backend.is_fp8_k_nvfp4_v
+                )
+                else self.q_data_type
+            )
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
@@ -3126,6 +3525,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                kv_data_type=ragged_kv_data_type,
             )
 
         if use_sliding_window_kv_pool:
@@ -3178,6 +3578,8 @@ class FlashInferIndicesUpdaterPrefill:
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.kv_data_type,
+            k_data_type=self.k_data_type,
+            v_data_type=self.v_data_type,
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
