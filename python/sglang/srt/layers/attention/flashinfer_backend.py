@@ -72,6 +72,18 @@ def _fp4_kv_dense_cache_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
 
 
+def _flashinfer_vo_split_enabled() -> bool:
+    return os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1"
+
+
+def _flashinfer_vo_split_head_dim_vo(head_dim_qk: int) -> int:
+    # Gemma 4 global layers are the current target: Q/K stay 512-wide while
+    # V/O are handled as two exact 256-wide passes.
+    if _flashinfer_vo_split_enabled() and head_dim_qk == 512:
+        return 256
+    return head_dim_qk
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -653,6 +665,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_fp8_k_nvfp4_v = self.is_nvfp4_native and _is_fp8_k_nvfp4_v_pool(
             self.token_to_kv_pool
         )
+        self.enable_vo_split = _flashinfer_vo_split_enabled()
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -674,6 +687,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLang FP4 KV mixed mode enabled: K cache uses FP8 e4m3, "
                 "V cache uses packed NVFP4. Capacity claims must use the "
                 "mixed-KV denominator, not full NVFP4 K+V."
+            )
+        if self.enable_vo_split:
+            logger.warning(
+                "SGLang FlashInfer VO split enabled: D=512 paged prefill "
+                "uses two D_VO=256 passes. Decode routing is not yet "
+                "rewired to decode-as-prefill."
             )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -1461,6 +1480,30 @@ class FlashInferAttnBackend(AttentionBackend):
             },
         )
 
+    def _should_vo_split(self, layer: RadixAttention) -> bool:
+        return self.enable_vo_split and layer.head_dim == 512
+
+    @staticmethod
+    def _slice_last_dim_for_vo_split(x: Optional[torch.Tensor], pass_id: int):
+        if x is None:
+            return None
+        half = x.shape[-1] // 2
+        return x[..., pass_id * half : (pass_id + 1) * half]
+
+    def _vo_split_paged_inputs(self, paged_kv_cache, paged_kv_kwargs, pass_id: int):
+        k_cache, v_cache = paged_kv_cache
+        split_kwargs = dict(paged_kv_kwargs)
+        if split_kwargs.get("kv_cache_sf") is not None:
+            k_sf, v_sf = split_kwargs["kv_cache_sf"]
+            split_kwargs["kv_cache_sf"] = (
+                k_sf,
+                self._slice_last_dim_for_vo_split(v_sf, pass_id),
+            )
+        return (
+            k_cache,
+            self._slice_last_dim_for_vo_split(v_cache, pass_id),
+        ), split_kwargs
+
     def _run_paged_native(
         self,
         wrapper,
@@ -1475,7 +1518,43 @@ class FlashInferAttnBackend(AttentionBackend):
         paged_kv_kwargs,
         trace_label=None,
         trace_layer=None,
+        vo_split: bool = False,
     ):
+        if vo_split:
+            outs = []
+            lse = None
+            for pass_id in range(2):
+                split_cache, split_kwargs = self._vo_split_paged_inputs(
+                    paged_kv_cache, paged_kv_kwargs, pass_id
+                )
+                result = self._run_paged_native(
+                    wrapper,
+                    q,
+                    split_cache,
+                    causal=causal,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    return_lse=return_lse,
+                    paged_kv_kwargs=split_kwargs,
+                    trace_label=(
+                        f"{trace_label}_vosplit{pass_id}"
+                        if trace_label is not None
+                        else None
+                    ),
+                    trace_layer=trace_layer,
+                    vo_split=False,
+                )
+                if return_lse:
+                    out_i, lse_i = result
+                    if lse is None:
+                        lse = lse_i
+                    outs.append(out_i)
+                else:
+                    outs.append(result)
+            out = torch.cat(outs, dim=-1)
+            return (out, lse) if return_lse else out
+
         wrapper._causal = causal
         wrapper._pos_encoding_mode = "NONE"
         wrapper._use_fp16_qk_reduction = False
@@ -2043,6 +2122,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_kwargs=paged_kv_kwargs,
                     trace_label="extend_paged",
                     trace_layer=layer,
+                    vo_split=self._should_vo_split(layer),
                 )
                 self._trace_nvfp4_dense_cache_state(
                     label="forward_extend_paged",
@@ -2188,6 +2268,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_kwargs=paged_kv_kwargs,
                         trace_label="extend_merge_paged",
                         trace_layer=layer,
+                        vo_split=self._should_vo_split(layer),
                     )
                 else:
                     o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -2355,6 +2436,7 @@ class FlashInferIndicesUpdaterDecode:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
+        self.head_dim_vo = _flashinfer_vo_split_head_dim_vo(self.head_dim)
         self.data_type = model_runner.kv_cache_dtype
         self.kv_data_type = (
             torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
@@ -2635,6 +2717,7 @@ class FlashInferIndicesUpdaterPrefill:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
+        self.head_dim_vo = _flashinfer_vo_split_head_dim_vo(self.head_dim)
         self.data_type = model_runner.kv_cache_dtype
         self.kv_data_type = (
             torch.uint8 if attn_backend.is_nvfp4_native else self.data_type
@@ -3008,6 +3091,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
+            head_dim_vo=self.head_dim_vo,
             q_data_type=self.q_data_type,
             kv_data_type=self.kv_data_type,
             k_data_type=self.k_data_type,
