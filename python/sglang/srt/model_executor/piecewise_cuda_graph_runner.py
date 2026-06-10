@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import os
 import warnings
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Union
@@ -465,6 +466,17 @@ class PiecewiseCudaGraphRunner:
             return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+        # With radix cache enabled, any EXTEND/prefill can populate prefix-cache
+        # entries that a later request reuses. On GB10/Qwen, graph-written
+        # prefix cache entries shift supplied-token PPL for both fp8 and
+        # mixed-KV, even when the later cached-prefix read runs eager. Route
+        # prefix-cache-writing prefills through eager until the graph-write
+        # path is repaired. Keep an opt-in for focused graph experiments only.
+        if (
+            not self.model_runner.server_args.disable_radix_cache
+            and os.environ.get("SGLANG_ALLOW_PREFIX_CACHE_PREFILL_CUDA_GRAPH") != "1"
+        ):
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:

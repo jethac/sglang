@@ -108,6 +108,10 @@ def _fp4_kv_k_global_scale_multiplier() -> float:
     return value if value > 0 else 1.0
 
 
+def _fp4_kv_mixed_kv_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_MIXED_KV") == "1"
+
+
 def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -1595,11 +1599,24 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 k = self.head_dim
                 v = self.v_head_dim
 
+                self.mixed_fp8_k_nvfp4_v = _fp4_kv_mixed_kv_enabled()
+                if self.mixed_fp8_k_nvfp4_v and not hasattr(
+                    torch, "float8_e4m3fn"
+                ):
+                    raise RuntimeError(
+                        "SGLANG_FP4_KV_MIXED_KV=1 requires torch.float8_e4m3fn "
+                        "for the K cache."
+                    )
                 self.store_dtype = torch.uint8
+                self.k_store_dtype = (
+                    torch.float8_e4m3fn
+                    if self.mixed_fp8_k_nvfp4_v
+                    else self.store_dtype
+                )
                 self.k_buffer = [
                     torch.zeros(
-                        (m, n, k // 2),
-                        dtype=self.store_dtype,
+                        (m, n, k if self.mixed_fp8_k_nvfp4_v else k // 2),
+                        dtype=self.k_store_dtype,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
@@ -1613,14 +1630,18 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
-                self.k_scale_buffer = [
-                    torch.zeros(
-                        (m, n, k // self.SF_VEC_SIZE),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                self.k_scale_buffer = (
+                    []
+                    if self.mixed_fp8_k_nvfp4_v
+                    else [
+                        torch.zeros(
+                            (m, n, k // self.SF_VEC_SIZE),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                )
                 self.v_scale_buffer = [
                     torch.zeros(
                         (m, n, v // self.SF_VEC_SIZE),
@@ -1704,14 +1725,20 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def get_kv_scale_buffer(self, layer_id: int):
         local_layer_id = layer_id - self.start_layer
+        k_scale = (
+            None
+            if self.mixed_fp8_k_nvfp4_v
+            else self.k_scale_buffer[local_layer_id].view(torch.float8_e4m3fn)
+        )
         return (
-            self.k_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+            k_scale,
             self.v_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
         )
 
     def get_kv_global_scale(self, layer_id: int):
         local_layer_id = layer_id - self.start_layer
-        return self.k_global_float[local_layer_id], self.v_global_float[local_layer_id]
+        k_global = 1.0 if self.mixed_fp8_k_nvfp4_v else self.k_global_float[local_layer_id]
+        return k_global, self.v_global_float[local_layer_id]
 
     def _get_kv_global_scale_tensor(self, layer_id: int):
         local_layer_id = layer_id - self.start_layer
@@ -1836,11 +1863,13 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def get_kv_size_bytes(self):
         k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
-        for k_scale_cache in self.k_scale_buffer:
-            k_size_bytes += get_tensor_size_bytes(k_scale_cache)
+        if not self.mixed_fp8_k_nvfp4_v:
+            for k_scale_cache in self.k_scale_buffer:
+                k_size_bytes += get_tensor_size_bytes(k_scale_cache)
         for v_scale_cache in self.v_scale_buffer:
             v_size_bytes += get_tensor_size_bytes(v_scale_cache)
-        k_size_bytes += get_tensor_size_bytes(self.k_global)
+        if not self.mixed_fp8_k_nvfp4_v:
+            k_size_bytes += get_tensor_size_bytes(self.k_global)
         v_size_bytes += get_tensor_size_bytes(self.v_global)
         return k_size_bytes, v_size_bytes
 
@@ -1883,8 +1912,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     "v_cache": _fp4_kv_trace_raw_bytes(
                         cache_v[source_index], byte_limit
                     ),
-                    "k_sf": _fp4_kv_trace_raw_bytes(
-                        cache_k_fp4_sf[source_index], byte_limit
+                    "k_sf": (
+                        _fp4_kv_trace_raw_bytes(
+                            cache_k_fp4_sf[source_index], byte_limit
+                        )
+                        if cache_k_fp4_sf is not None
+                        else None
                     ),
                     "v_sf": _fp4_kv_trace_raw_bytes(
                         cache_v_fp4_sf[source_index], byte_limit
@@ -1897,8 +1930,12 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                     "v_cache": _fp4_kv_trace_raw_bytes(
                         self.v_buffer[local_layer_id][page], byte_limit
                     ),
-                    "k_sf": _fp4_kv_trace_raw_bytes(
-                        self.k_scale_buffer[local_layer_id][page], byte_limit
+                    "k_sf": (
+                        _fp4_kv_trace_raw_bytes(
+                            self.k_scale_buffer[local_layer_id][page], byte_limit
+                        )
+                        if cache_k_fp4_sf is not None
+                        else None
                     ),
                     "v_sf": _fp4_kv_trace_raw_bytes(
                         self.v_scale_buffer[local_layer_id][page], byte_limit
@@ -2064,27 +2101,34 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
         dense_cache_k = cache_k.contiguous()
         dense_cache_v = cache_v.contiguous()
-        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
-            dense_cache_k, k_global
-        )
+        if self.mixed_fp8_k_nvfp4_v:
+            cache_k = dense_cache_k.to(torch.float8_e4m3fn)
+            cache_k_fp4_sf = None
+        else:
+            cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
+                dense_cache_k, k_global
+            )
         cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             dense_cache_v, v_global
         )
 
-        self._trace_fp4_kv_quant_error(
-            layer_id=layer_id,
-            loc=loc,
-            dense_k=dense_cache_k,
-            dense_v=dense_cache_v,
-            quant_k=cache_k,
-            quant_v=cache_v,
-            quant_k_sf=cache_k_fp4_sf,
-            quant_v_sf=cache_v_fp4_sf,
-        )
+        if cache_k_fp4_sf is not None:
+            self._trace_fp4_kv_quant_error(
+                layer_id=layer_id,
+                loc=loc,
+                dense_k=dense_cache_k,
+                dense_v=dense_cache_v,
+                quant_k=cache_k,
+                quant_v=cache_v,
+                quant_k_sf=cache_k_fp4_sf,
+                quant_v_sf=cache_v_fp4_sf,
+            )
 
-        cache_k = cache_k.view(self.store_dtype)
+        if not self.mixed_fp8_k_nvfp4_v:
+            cache_k = cache_k.view(self.store_dtype)
         cache_v = cache_v.view(self.store_dtype)
-        cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
+        if cache_k_fp4_sf is not None:
+            cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
         cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
 
         if get_is_capture_mode() and self.alt_stream is not None:
@@ -2093,7 +2137,10 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.alt_stream.wait_stream(current_stream)
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
+            if cache_k_fp4_sf is not None:
+                self.k_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_fp4_sf
+                )
             with self.device_module.stream(self.alt_stream):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
@@ -2103,7 +2150,10 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
+            if cache_k_fp4_sf is not None:
+                self.k_scale_buffer[layer_id - self.start_layer][loc] = (
+                    cache_k_fp4_sf
+                )
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
         self._trace_fp4_kv_write(
