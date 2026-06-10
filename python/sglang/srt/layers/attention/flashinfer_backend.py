@@ -2663,6 +2663,21 @@ class FlashInferIndicesUpdaterDecode:
 
         if wrapper_uses_fast_decode_plan:
             # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
+            plan_kwargs = {
+                "data_type": self.kv_data_type,
+                "q_data_type": self.q_data_type,
+                "non_blocking": True,
+                "fixed_split_size": fixed_split_size,
+                "disable_split_kv": (
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+                "global_override_indptr_cpu": global_override_indptr_cpu,
+            }
+            if self.k_data_type != self.v_data_type:
+                plan_kwargs.update(
+                    k_data_type=self.k_data_type,
+                    v_data_type=self.v_data_type,
+                )
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
@@ -2671,19 +2686,24 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_kv_heads,
                 self.head_dim,
                 1,
-                data_type=self.kv_data_type,
-                k_data_type=self.k_data_type,
-                v_data_type=self.v_data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                **plan_kwargs,
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
+            plan_kwargs = {
+                "data_type": self.kv_data_type,
+                "q_data_type": self.q_data_type,
+                "non_blocking": True,
+                "fixed_split_size": fixed_split_size,
+                "disable_split_kv": (
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+            }
+            if self.k_data_type != self.v_data_type:
+                plan_kwargs.update(
+                    k_data_type=self.k_data_type,
+                    v_data_type=self.v_data_type,
+                )
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
@@ -2692,15 +2712,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_kv_heads,
                 self.head_dim,
                 1,
-                data_type=self.kv_data_type,
-                k_data_type=self.k_data_type,
-                v_data_type=self.v_data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
+                **plan_kwargs,
             )
 
         if locally_override:
@@ -3082,6 +3094,23 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        paged_plan_kwargs = {
+            "head_dim_vo": self.head_dim_vo,
+            "q_data_type": self.q_data_type,
+            "kv_data_type": self.kv_data_type,
+            "custom_mask": use_custom_mask,
+            "non_blocking": True,
+            "fixed_split_size": fixed_split_size,
+            "prefix_len_ptr": prefix_len_ptr,
+            "token_pos_in_items_ptr": token_pos_in_items_ptr,
+            "token_pos_in_items_len": token_pos_in_items_len,
+            "max_item_len_ptr": max_item_len_ptr,
+        }
+        if self.k_data_type != self.v_data_type:
+            paged_plan_kwargs.update(
+                k_data_type=self.k_data_type,
+                v_data_type=self.v_data_type,
+            )
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -3091,18 +3120,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_kv_heads,
             self.head_dim,
             1,
-            head_dim_vo=self.head_dim_vo,
-            q_data_type=self.q_data_type,
-            kv_data_type=self.kv_data_type,
-            k_data_type=self.k_data_type,
-            v_data_type=self.v_data_type,
-            custom_mask=use_custom_mask,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            prefix_len_ptr=prefix_len_ptr,
-            token_pos_in_items_ptr=token_pos_in_items_ptr,
-            token_pos_in_items_len=token_pos_in_items_len,
-            max_item_len_ptr=max_item_len_ptr,
+            **paged_plan_kwargs,
         )
 
 
