@@ -326,15 +326,34 @@ def _flashinfer_wrapper_geometries(
 ) -> List[FlashInferWrapperGeometry]:
     tp_size = get_attention_tp_size()
     hf_config = model_config.hf_config
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        if hasattr(hf_config, "get_text_config"):
+            hf_text_config = hf_config.get_text_config()
+        else:
+            hf_text_config = getattr(hf_config, "text_config", hf_config)
+
+    num_attention_heads = getattr(
+        hf_text_config, "num_attention_heads", model_config.num_attention_heads
+    )
+    total_num_kv_heads = getattr(hf_text_config, "num_key_value_heads", None)
+    num_kv_heads = (
+        _tp_sharded_kv_heads(total_num_kv_heads, tp_size)
+        if total_num_kv_heads is not None
+        else model_config.get_num_kv_heads(tp_size)
+    )
+    head_dim = getattr(hf_text_config, "head_dim", model_config.head_dim)
     base = FlashInferWrapperGeometry(
-        num_qo_heads=model_config.num_attention_heads // tp_size,
-        num_kv_heads=model_config.get_num_kv_heads(tp_size),
-        head_dim=model_config.head_dim,
-        head_dim_vo=_flashinfer_vo_split_head_dim_vo(model_config.head_dim),
+        num_qo_heads=num_attention_heads // tp_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        head_dim_vo=_flashinfer_vo_split_head_dim_vo(head_dim),
     )
     if dispatch_reason == WrapperDispatch.SLIDING_WINDOW and num_wrappers == 2:
-        swa_head_dim = getattr(hf_config, "swa_head_dim", base.head_dim)
-        swa_total_num_kv_heads = getattr(hf_config, "swa_num_key_value_heads", None)
+        swa_head_dim = getattr(hf_text_config, "swa_head_dim", base.head_dim)
+        swa_total_num_kv_heads = getattr(
+            hf_text_config, "swa_num_key_value_heads", None
+        )
         swa_num_kv_heads = (
             _tp_sharded_kv_heads(swa_total_num_kv_heads, tp_size)
             if swa_total_num_kv_heads is not None
