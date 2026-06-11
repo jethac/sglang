@@ -4,6 +4,7 @@ from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
+from sglang.srt.configs.diffusion_gemma import DiffusionGemmaConfig
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
@@ -47,6 +48,7 @@ __all__ = [
     "ChatGLMConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
+    "DiffusionGemmaConfig",
     "LongcatFlashConfig",
     "MultiModalityConfig",
     "KimiVLConfig",

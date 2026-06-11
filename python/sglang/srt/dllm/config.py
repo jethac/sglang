@@ -38,7 +38,14 @@ class DllmConfig:
         }
 
         arch = model_config.hf_config.architectures[0]
-        if arch in DLLM_PARAMS:
+        if arch == "DiffusionGemmaForBlockDiffusion":
+            block_size = getattr(model_config.hf_config, "canvas_length", 256)
+            mask_id = getattr(
+                model_config.hf_config,
+                "mask_token_id",
+                getattr(model_config.hf_config, "pad_token_id", 0),
+            )
+        elif arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
