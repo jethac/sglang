@@ -83,6 +83,10 @@ def _fp4_kv_dense_cache_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_DENSE_CACHE") == "1"
 
 
+def _gemma4_geometry_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_GEMMA4_TRACE_GEOMETRY") == "1"
+
+
 def _flashinfer_vo_split_enabled() -> bool:
     return os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1"
 
@@ -295,6 +299,53 @@ if is_flashinfer_available():
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+@dataclass(frozen=True)
+class FlashInferWrapperGeometry:
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    head_dim_vo: int
+
+
+def _tp_sharded_kv_heads(total_num_kv_heads: int, tp_size: int) -> int:
+    if total_num_kv_heads >= tp_size:
+        assert total_num_kv_heads % tp_size == 0
+        return total_num_kv_heads // tp_size
+    assert tp_size % total_num_kv_heads == 0
+    return 1
+
+
+def _flashinfer_wrapper_geometries(
+    model_config, dispatch_reason: Optional[WrapperDispatch], num_wrappers: int
+) -> List[FlashInferWrapperGeometry]:
+    tp_size = get_attention_tp_size()
+    hf_config = model_config.hf_config
+    base = FlashInferWrapperGeometry(
+        num_qo_heads=model_config.num_attention_heads // tp_size,
+        num_kv_heads=model_config.get_num_kv_heads(tp_size),
+        head_dim=model_config.head_dim,
+        head_dim_vo=_flashinfer_vo_split_head_dim_vo(model_config.head_dim),
+    )
+    if dispatch_reason == WrapperDispatch.SLIDING_WINDOW and num_wrappers == 2:
+        swa_head_dim = getattr(hf_config, "swa_head_dim", base.head_dim)
+        swa_total_num_kv_heads = getattr(hf_config, "swa_num_key_value_heads", None)
+        swa_num_kv_heads = (
+            _tp_sharded_kv_heads(swa_total_num_kv_heads, tp_size)
+            if swa_total_num_kv_heads is not None
+            else base.num_kv_heads
+        )
+        return [
+            FlashInferWrapperGeometry(
+                num_qo_heads=base.num_qo_heads,
+                num_kv_heads=swa_num_kv_heads,
+                head_dim=swa_head_dim,
+                head_dim_vo=_flashinfer_vo_split_head_dim_vo(swa_head_dim),
+            ),
+            base,
+        ]
+    return [base for _ in range(num_wrappers)]
 
 
 @dataclass
@@ -886,8 +937,69 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_prefix_ref_trace_seen = set()
         self._nvfp4_dense_cache_trace_seen = set()
         self._nvfp4_module_trace_seen = set()
+        self._geometry_trace_seen = set()
+        self.wrapper_geometries = _flashinfer_wrapper_geometries(
+            model_runner.model_config, self.dispatch_reason, self.num_wrappers
+        )
+        if _gemma4_geometry_trace_enabled():
+            logger.warning(
+                "SGLang FlashInfer wrapper geometries dispatch=%s geometries=%s",
+                self.dispatch_reason,
+                self.wrapper_geometries,
+            )
         self._nvfp4_last_paged_plan = {}
         self._nvfp4_last_paged_plan_tensors = {}
+
+    def _trace_gemma4_geometry_dispatch(
+        self,
+        *,
+        label: Optional[str],
+        layer: Optional[RadixAttention],
+        paged_kv_cache=None,
+        paged_kv_kwargs=None,
+        wrapper=None,
+        vo_split: bool = False,
+    ) -> None:
+        if (
+            not _gemma4_geometry_trace_enabled()
+            or layer is None
+            or label is None
+        ):
+            return
+        layer_id = getattr(layer, "layer_id", None)
+        key = (label, int(layer_id) if layer_id is not None else None)
+        if key in self._geometry_trace_seen:
+            return
+        self._geometry_trace_seen.add(key)
+        k_sf = v_sf = None
+        if isinstance(paged_kv_kwargs, dict):
+            k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+        wrapper_id = self._get_wrapper_idx(layer)
+        planned = (
+            self.wrapper_geometries[wrapper_id]
+            if 0 <= wrapper_id < len(self.wrapper_geometries)
+            else None
+        )
+        logger.warning(
+            "SGLang Gemma4 FlashInfer geometry label=%s layer=%s "
+            "wrapper_id=%s planned=%s layer_q_heads=%s layer_k_heads=%s "
+            "layer_v_heads=%s layer_head_dim=%s sliding_window=%s "
+            "vo_split=%s wrapper=%s kv_cache=%s k_sf=%s v_sf=%s",
+            label,
+            layer_id,
+            wrapper_id,
+            planned,
+            getattr(layer, "tp_q_head_num", None),
+            getattr(layer, "tp_k_head_num", None),
+            getattr(layer, "tp_v_head_num", None),
+            getattr(layer, "head_dim", None),
+            getattr(layer, "sliding_window_size", None),
+            vo_split,
+            _flashinfer_wrapper_trace_summary(wrapper),
+            _tensor_trace_summary(paged_kv_cache),
+            _tensor_trace_summary(k_sf),
+            _tensor_trace_summary(v_sf),
+        )
 
     def _trace_nvfp4_native_call(
         self,
@@ -1614,6 +1726,14 @@ class FlashInferAttnBackend(AttentionBackend):
         wrapper._sm_scale = sm_scale
         wrapper._rope_scale = None
         wrapper._rope_theta = None
+        self._trace_gemma4_geometry_dispatch(
+            label=trace_label,
+            layer=trace_layer,
+            paged_kv_cache=paged_kv_cache,
+            paged_kv_kwargs=paged_kv_kwargs,
+            wrapper=wrapper,
+            vo_split=vo_split,
+        )
         out = wrapper.run(
             q, paged_kv_cache, return_lse=return_lse, **paged_kv_kwargs
         )
@@ -2158,14 +2278,19 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_kwargs=paged_kv_kwargs,
                 )
             else:
-                o = prefill_wrapper_paged.forward(
+                o = self._run_paged_native(
+                    prefill_wrapper_paged,
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     paged_kv_cache,
                     causal=causal,
                     sm_scale=layer.scaling,
                     window_left=paged_window_left,
                     logits_soft_cap=logits_soft_cap,
-                    **paged_kv_kwargs,
+                    return_lse=False,
+                    paged_kv_kwargs=paged_kv_kwargs,
+                    trace_label="extend_paged",
+                    trace_layer=layer,
+                    vo_split=self._should_vo_split(layer),
                 )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
@@ -2296,14 +2421,19 @@ class FlashInferAttnBackend(AttentionBackend):
                         vo_split=self._should_vo_split(layer),
                     )
                 else:
-                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                        q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    o2, s2 = self._run_paged_native(
+                        prefill_wrapper_paged,
+                        q_native,
                         paged_kv_cache,
                         causal=False,
                         sm_scale=layer.scaling,
                         window_left=swa_window_left,
                         logits_soft_cap=logits_soft_cap,
-                        **paged_kv_kwargs,
+                        return_lse=True,
+                        paged_kv_kwargs=paged_kv_kwargs,
+                        trace_label="extend_merge_paged",
+                        trace_layer=layer,
+                        vo_split=self._should_vo_split(layer),
                     )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
@@ -2417,6 +2547,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 trace_layer=layer,
             )
         else:
+            self._trace_gemma4_geometry_dispatch(
+                label="decode",
+                layer=layer,
+                paged_kv_cache=paged_kv_cache,
+                paged_kv_kwargs=paged_kv_kwargs,
+                wrapper=decode_wrapper,
+                vo_split=False,
+            )
             o = decode_wrapper.forward(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 paged_kv_cache,
@@ -2463,6 +2601,7 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.wrapper_geometries = attn_backend.wrapper_geometries
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -2570,6 +2709,7 @@ class FlashInferIndicesUpdaterDecode:
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                wrapper_id=wrapper_id,
             )
 
     def update_cross_attention(
@@ -2609,6 +2749,7 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu=kv_lens_cpu,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                wrapper_id=wrapper_id,
             )
 
     def call_begin_forward(
@@ -2624,6 +2765,7 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        wrapper_id: int = 0,
     ):
         if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
@@ -2692,13 +2834,14 @@ class FlashInferIndicesUpdaterDecode:
                     k_data_type=self.k_data_type,
                     v_data_type=self.v_data_type,
                 )
+            geom = self.wrapper_geometries[wrapper_id]
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                geom.num_qo_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
                 1,
                 **plan_kwargs,
             )
@@ -2718,13 +2861,14 @@ class FlashInferIndicesUpdaterDecode:
                     k_data_type=self.k_data_type,
                     v_data_type=self.v_data_type,
                 )
+            geom = self.wrapper_geometries[wrapper_id]
             wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
                 self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                geom.num_qo_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
                 1,
                 **plan_kwargs,
             )
@@ -2757,6 +2901,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.wrapper_geometries = attn_backend.wrapper_geometries
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -3025,6 +3170,7 @@ class FlashInferIndicesUpdaterPrefill:
         wrapper_id: int = 0,
     ):
         bs = len(seq_lens)
+        geom = self.wrapper_geometries[wrapper_id]
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -3087,9 +3233,9 @@ class FlashInferIndicesUpdaterPrefill:
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
+                geom.num_qo_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
                 q_data_type=self.q_data_type,
                 kv_data_type=ragged_kv_data_type,
             )
@@ -3135,7 +3281,7 @@ class FlashInferIndicesUpdaterPrefill:
             max_item_len_ptr = None
 
         paged_plan_kwargs = {
-            "head_dim_vo": self.head_dim_vo,
+            "head_dim_vo": geom.head_dim_vo,
             "q_data_type": self.q_data_type,
             "kv_data_type": self.kv_data_type,
             "custom_mask": use_custom_mask,
@@ -3156,9 +3302,9 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr,
             kv_indices,
             self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
+            geom.num_qo_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
             1,
             **paged_plan_kwargs,
         )
