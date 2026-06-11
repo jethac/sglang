@@ -2379,11 +2379,17 @@ class ServerArgs:
 
             prefill_backend, decode_backend = self.get_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "intel_xpu")
+            if os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1":
+                accepted_backends = accepted_backends + ("flashinfer",)
+                logger.warning(
+                    "Enable experimental FlashInfer attention backend for Gemma4 "
+                    "under SGLANG_FLASHINFER_VOSPLIT=1."
+                )
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
+                f"Gemma4 only supports {accepted_backends} attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
