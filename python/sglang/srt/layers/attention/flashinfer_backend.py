@@ -799,8 +799,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.enable_vo_split:
             logger.warning(
                 "SGLang FlashInfer VO split enabled: D=512 paged prefill "
-                "uses two D_VO=256 passes. Decode routing is not yet "
-                "rewired to decode-as-prefill."
+                "and decode-as-prefill use two D_VO=256 passes."
             )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -2351,6 +2350,65 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
         return out
 
+    def _plan_decode_as_prefill_vo_split(
+        self,
+        *,
+        decode_wrapper,
+        prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        q: torch.Tensor,
+        layer: RadixAttention,
+    ) -> None:
+        if self.skip_prefill:
+            raise RuntimeError("VO-split decode-as-prefill requires prefill wrappers")
+
+        wrapper_id = self._get_wrapper_idx(layer)
+        geom = self.wrapper_geometries[wrapper_id]
+        bs = q.shape[0]
+        qo_indptr = self.qo_indptr[wrapper_id]
+        qo_indptr[: bs + 1].copy_(
+            torch.arange(bs + 1, dtype=torch.int32, device=qo_indptr.device)
+        )
+        qo_indptr = qo_indptr[: bs + 1]
+
+        if not all(
+            hasattr(decode_wrapper, name)
+            for name in (
+                "_paged_kv_indptr_buf",
+                "_paged_kv_indices_buf",
+                "_paged_kv_last_page_len_buf",
+            )
+        ):
+            raise RuntimeError(
+                "VO-split decode-as-prefill requires a planned decode wrapper"
+            )
+
+        updater = self.indices_updater_prefill
+        plan_kwargs = {
+            "head_dim_vo": geom.head_dim_vo,
+            "q_data_type": updater.q_data_type,
+            "kv_data_type": updater.kv_data_type,
+            "custom_mask": None,
+            "non_blocking": True,
+            "fixed_split_size": self.prefill_split_tile_size,
+        }
+        if updater.k_data_type != updater.v_data_type:
+            plan_kwargs.update(
+                k_data_type=updater.k_data_type,
+                v_data_type=updater.v_data_type,
+            )
+
+        prefill_wrapper.begin_forward(
+            qo_indptr,
+            decode_wrapper._paged_kv_indptr_buf[: bs + 1],
+            decode_wrapper._paged_kv_indices_buf,
+            decode_wrapper._paged_kv_last_page_len_buf[:bs],
+            geom.num_qo_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
+            1,
+            **plan_kwargs,
+        )
+
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
     ) -> MultiItemScoringParams:
@@ -3099,6 +3157,31 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         paged_kv_cache, paged_kv_kwargs = self._get_paged_kv_cache_and_kwargs(layer)
+        if self._should_vo_split(layer):
+            q_native = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            prefill_wrapper = self.prefill_wrappers_paged[self._get_wrapper_idx(layer)]
+            self._plan_decode_as_prefill_vo_split(
+                decode_wrapper=decode_wrapper,
+                prefill_wrapper=prefill_wrapper,
+                q=q_native,
+                layer=layer,
+            )
+            o = self._run_paged_native(
+                prefill_wrapper,
+                q_native,
+                paged_kv_cache,
+                causal=False,
+                sm_scale=layer.scaling,
+                window_left=-1,
+                logits_soft_cap=layer.logit_cap,
+                return_lse=False,
+                paged_kv_kwargs=paged_kv_kwargs,
+                trace_label="decode_as_prefill",
+                trace_layer=layer,
+                vo_split=True,
+            )
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
         if self.is_nvfp4_native:
             q_native = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             self._trace_nvfp4_native_call(
