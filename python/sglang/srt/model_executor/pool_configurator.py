@@ -88,6 +88,22 @@ def _mixed_fp8_k_nvfp4_v_cell_size(
     return k_data_size + v_data_size + v_scale_size
 
 
+def _full_nvfp4_kv_cell_size(
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    num_layers: int,
+    kv_size: int,
+) -> int:
+    """Per-token bytes for full NVFP4 K+V cache data and block scales."""
+    scale_block_size = 16
+    k_data_size = head_num * (head_dim // 2) * num_layers * kv_size
+    v_data_size = head_num * (v_head_dim // 2) * num_layers * kv_size
+    k_scale_size = head_num * (head_dim // scale_block_size) * num_layers * kv_size
+    v_scale_size = head_num * (v_head_dim // scale_block_size) * num_layers * kv_size
+    return k_data_size + v_data_size + k_scale_size + v_scale_size
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -195,8 +211,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
                 if _fp4_kv_mixed_kv_enabled():
@@ -208,8 +222,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kv_size,
                     )
                 else:
-                    cell_size = (cell_size // 2) + (
-                        (n * k * num_layers * 2 * kv_size) // scale_block_size
+                    cell_size = _full_nvfp4_kv_cell_size(
+                        n,
+                        k,
+                        model_config.v_head_dim,
+                        num_layers,
+                        kv_size,
                     )
 
         return cell_size
@@ -250,14 +268,23 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
         # Full layer per-token memory (bytes)
-        if is_float4_e2m1fn_x2(kv_cache_dtype) and _fp4_kv_mixed_kv_enabled():
-            self._full_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
-                model_config.get_num_kv_heads(tp_size),
-                model_config.head_dim,
-                model_config.v_head_dim,
-                1,
-                kv_size,
-            )
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if _fp4_kv_mixed_kv_enabled():
+                self._full_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
+                    model_config.get_num_kv_heads(tp_size),
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    1,
+                    kv_size,
+                )
+            else:
+                self._full_per_token = _full_nvfp4_kv_cell_size(
+                    model_config.get_num_kv_heads(tp_size),
+                    model_config.head_dim,
+                    model_config.v_head_dim,
+                    1,
+                    kv_size,
+                )
         else:
             self._full_per_token = (
                 model_config.get_num_kv_heads(tp_size)
@@ -266,14 +293,23 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
 
         # SWA layer per-token memory (bytes)
-        if is_float4_e2m1fn_x2(kv_cache_dtype) and _fp4_kv_mixed_kv_enabled():
-            self._swa_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
-                model_config.get_swa_num_kv_heads(tp_size),
-                model_config.swa_head_dim,
-                model_config.swa_v_head_dim,
-                1,
-                kv_size,
-            )
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if _fp4_kv_mixed_kv_enabled():
+                self._swa_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
+                    model_config.get_swa_num_kv_heads(tp_size),
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                    1,
+                    kv_size,
+                )
+            else:
+                self._swa_per_token = _full_nvfp4_kv_cell_size(
+                    model_config.get_swa_num_kv_heads(tp_size),
+                    model_config.swa_head_dim,
+                    model_config.swa_v_head_dim,
+                    1,
+                    kv_size,
+                )
         else:
             self._swa_per_token = (
                 model_config.get_swa_num_kv_heads(tp_size)
