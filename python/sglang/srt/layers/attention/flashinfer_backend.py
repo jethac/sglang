@@ -917,6 +917,17 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        self._geometry_trace_seen = set()
+        self.wrapper_geometries = _flashinfer_wrapper_geometries(
+            model_runner.model_config, self.dispatch_reason, self.num_wrappers
+        )
+        if _gemma4_geometry_trace_enabled():
+            logger.warning(
+                "SGLang FlashInfer wrapper geometries dispatch=%s geometries=%s",
+                self.dispatch_reason,
+                self.wrapper_geometries,
+            )
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -937,16 +948,6 @@ class FlashInferAttnBackend(AttentionBackend):
         self._nvfp4_prefix_ref_trace_seen = set()
         self._nvfp4_dense_cache_trace_seen = set()
         self._nvfp4_module_trace_seen = set()
-        self._geometry_trace_seen = set()
-        self.wrapper_geometries = _flashinfer_wrapper_geometries(
-            model_runner.model_config, self.dispatch_reason, self.num_wrappers
-        )
-        if _gemma4_geometry_trace_enabled():
-            logger.warning(
-                "SGLang FlashInfer wrapper geometries dispatch=%s geometries=%s",
-                self.dispatch_reason,
-                self.wrapper_geometries,
-            )
         self._nvfp4_last_paged_plan = {}
         self._nvfp4_last_paged_plan_tensors = {}
 
