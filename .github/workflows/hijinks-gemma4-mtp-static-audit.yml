@@ -1,0 +1,200 @@
+name: hijinks-gemma4-mtp-static-audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - spark/hijinks-024-diffusiongemma-upstream-rebase
+    paths:
+      - ".github/workflows/hijinks-gemma4-mtp-static-audit.yml"
+      - "python/sglang/srt/arg_groups/speculative_hook.py"
+      - "python/sglang/srt/speculative/frozen_kv_mtp_*.py"
+      - "python/sglang/srt/speculative/spec_info.py"
+      - "python/sglang/srt/models/gemma4_mtp.py"
+      - "python/sglang/srt/layers/attention/flashinfer_backend.py"
+      - "python/sglang/srt/layers/attention/hybrid_attn_backend.py"
+      - "python/sglang/srt/mem_cache/common.py"
+
+permissions:
+  contents: read
+
+jobs:
+  static-audit:
+    name: Gemma 4 MTP static audit
+    runs-on: [self-hosted, Linux, X64, ubicloud-persistent-build-x64, sglang-wheel]
+    timeout-minutes: 10
+    env:
+      CUDA_HOME: /usr/local/cuda
+      CCACHE_DIR: /opt/build-cache/ccache
+      CCACHE_MAXSIZE: 100G
+      PATH: /usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          hostname
+          nproc
+          free -h
+          df -h / /opt/build-cache || true
+          python3 --version
+          nvcc --version || true
+          ccache --show-config | grep -E 'cache_dir|max_size' || true
+      - name: Gemma 4 MTP static audit
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import ast
+          import compileall
+          import json
+          import pathlib
+
+          root = pathlib.Path.cwd()
+          files = [
+              "python/sglang/srt/arg_groups/speculative_hook.py",
+              "python/sglang/srt/speculative/frozen_kv_mtp_info.py",
+              "python/sglang/srt/speculative/frozen_kv_mtp_utils.py",
+              "python/sglang/srt/speculative/frozen_kv_mtp_worker.py",
+              "python/sglang/srt/speculative/spec_info.py",
+              "python/sglang/srt/models/gemma4_mtp.py",
+              "python/sglang/srt/layers/attention/flashinfer_backend.py",
+              "python/sglang/srt/layers/attention/hybrid_attn_backend.py",
+              "python/sglang/srt/mem_cache/common.py",
+          ]
+          missing = [path for path in files if not (root / path).exists()]
+          if missing:
+              raise SystemExit(f"missing expected files: {missing}")
+
+          compiled = []
+          for rel in files:
+              path = root / rel
+              if not compileall.compile_file(str(path), quiet=1, force=True):
+                  raise SystemExit(f"compile failed: {rel}")
+              compiled.append(rel)
+
+          def read(rel):
+              return (root / rel).read_text(encoding="utf-8-sig")
+
+          def parse(rel):
+              return ast.parse(read(rel), filename=rel)
+
+          gemma_tree = parse("python/sglang/srt/models/gemma4_mtp.py")
+          class_names = {
+              node.name for node in ast.walk(gemma_tree) if isinstance(node, ast.ClassDef)
+          }
+          required_classes = {
+              "Gemma4AssistantForCausalLM",
+              "Gemma4UnifiedAssistantForCausalLM",
+          }
+          missing_classes = sorted(required_classes - class_names)
+          if missing_classes:
+              raise SystemExit(f"gemma4_mtp missing classes: {missing_classes}")
+
+          gemma_source = read("python/sglang/srt/models/gemma4_mtp.py")
+          for needle in [
+              "EntryClass = [Gemma4AssistantForCausalLM, Gemma4UnifiedAssistantForCausalLM]",
+              "build_frozen_kv_mtp_context",
+              "bind_frozen_kv_context",
+              "target_token_to_kv_pool",
+              "kv_shared_layer_index",
+          ]:
+              if needle not in gemma_source:
+                  raise SystemExit(f"gemma4_mtp missing marker: {needle}")
+
+          hook_source = read("python/sglang/srt/arg_groups/speculative_hook.py")
+          for needle in [
+              "_resolve_speculative_algorithm_alias",
+              "Gemma4AssistantForCausalLM",
+              "Gemma4UnifiedAssistantForCausalLM",
+              'speculative_algorithm == "EAGLE3"',
+              'return "FROZEN_KV_MTP"',
+              "_handle_frozen_kv_mtp",
+          ]:
+              if needle not in hook_source:
+                  raise SystemExit(f"speculative_hook missing marker: {needle}")
+
+          spec_source = read("python/sglang/srt/speculative/spec_info.py")
+          for needle in [
+              "FROZEN_KV_MTP",
+              "def is_frozen_kv_mtp",
+              "def supports_spec_v2",
+              "and not self.is_frozen_kv_mtp()",
+              "FrozenKVMTPWorker",
+              "FROZEN_KV_MTP does not support spec v2",
+          ]:
+              if needle not in spec_source:
+                  raise SystemExit(f"spec_info missing marker: {needle}")
+
+          worker_source = read("python/sglang/srt/speculative/frozen_kv_mtp_worker.py")
+          for needle in [
+              "class FrozenKVMTPWorker",
+              "target_worker.get_memory_pool()",
+              "target_worker.model_runner.token_to_kv_pool",
+              "bind_frozen_kv_context",
+              "self.topk == 1",
+              "topk > 1 currently supports only the triton",
+              "ForwardMode.TARGET_VERIFY",
+              "batch_result = self.target_worker.forward_batch_generation",
+          ]:
+              if needle not in worker_source:
+                  raise SystemExit(f"frozen_kv_mtp_worker missing marker: {needle}")
+
+          utils_source = read("python/sglang/srt/speculative/frozen_kv_mtp_utils.py")
+          for needle in [
+              "frozen_kv_target_view",
+              "target_kv_pool_view",
+              "draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool",
+              "set_frozen_kv_positions",
+          ]:
+              if needle not in utils_source:
+                  raise SystemExit(f"frozen_kv_mtp_utils missing marker: {needle}")
+
+          fi_source = read("python/sglang/srt/layers/attention/flashinfer_backend.py")
+          for needle in [
+              "forward_mode.is_target_verify()",
+              "self.prefill_wrappers_verify",
+              "torch.uint8 if attn_backend.is_nvfp4_native else self.data_type",
+              "torch.float8_e4m3fn",
+              "k_data_type=updater.k_data_type",
+              "v_data_type=updater.v_data_type",
+              '"kv_cache_sf"',
+          ]:
+              if needle not in fi_source:
+                  raise SystemExit(f"flashinfer_backend missing marker: {needle}")
+
+          hybrid_source = read("python/sglang/srt/layers/attention/hybrid_attn_backend.py")
+          for needle in [
+              "forward_mode.is_target_verify() or forward_mode.is_draft_extend()",
+              'speculative_attention_mode == "decode"',
+              "else self.prefill_backend",
+          ]:
+              if needle not in hybrid_source:
+                  raise SystemExit(f"hybrid_attn_backend missing marker: {needle}")
+
+          mem_source = read("python/sglang/srt/mem_cache/common.py")
+          for needle in [
+              "get_alloc_len_per_decode",
+              "speculative_num_steps",
+              "speculative_eagle_topk",
+              "max_speculative_num_draft_tokens",
+              "get_req_to_token_extra_context_len",
+          ]:
+              if needle not in mem_source:
+                  raise SystemExit(f"mem_cache/common missing marker: {needle}")
+
+          payload = {
+              "ok": True,
+              "compiled": compiled,
+              "runner": "ubicloud-persistent-sglang-x64",
+              "scope": "static source audit only; no model weights, no serving claim",
+              "gates": [
+                  "Gemma4 assistant classes registered",
+                  "NEXTN/EAGLE alias path can promote assistants to FROZEN_KV_MTP",
+                  "EAGLE3 assistant rejection marker present",
+                  "FrozenKVMTPWorker binds target KV pool",
+                  "TARGET_VERIFY routes through FlashInfer prefill metadata",
+                  "full NVFP4 uses one uint8 KV container; mixed KV has split K/V dtype markers",
+              ],
+          }
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
