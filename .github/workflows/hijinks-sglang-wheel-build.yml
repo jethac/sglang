@@ -23,10 +23,10 @@ jobs:
     env:
       CCACHE_DIR: /opt/build-cache/ccache
       CCACHE_MAXSIZE: 100G
-      CARGO_HOME: /opt/build-cache/cargo
-      RUSTUP_HOME: /opt/build-cache/rustup
-      PIP_CACHE_DIR: /opt/build-cache/pip
-      PATH: /opt/build-cache/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+      CARGO_HOME: /home/jethac/.cache/hijinks-build/cargo
+      RUSTUP_HOME: /home/jethac/.cache/hijinks-build/rustup
+      PIP_CACHE_DIR: /home/jethac/.cache/hijinks-build/pip
+      PATH: /home/jethac/.cache/hijinks-build/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,8 +46,8 @@ jobs:
       - name: Prepare persistent build caches
         run: |
           set -euxo pipefail
-          sudo mkdir -p "$CCACHE_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
-          sudo chown -R "$(id -u):$(id -g)" "$CCACHE_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
+          test -d "$CCACHE_DIR"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
