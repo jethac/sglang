@@ -1,0 +1,146 @@
+name: hijinks-dgemma-static-audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - spark/hijinks-024-diffusiongemma-upstream-rebase
+    paths:
+      - ".github/workflows/hijinks-dgemma-static-audit.yml"
+      - "python/sglang/srt/dllm/**"
+      - "python/sglang/srt/models/gemma4_diffusion.py"
+      - "python/sglang/srt/multimodal/processors/diffusion_gemma.py"
+      - "python/sglang/srt/configs/**"
+
+permissions:
+  contents: read
+
+jobs:
+  static-audit:
+    name: DiffusionGemma static runtime audit
+    runs-on: [self-hosted, Linux, X64, ubicloud-persistent-build-x64, sglang-wheel]
+    timeout-minutes: 10
+    env:
+      CUDA_HOME: /usr/local/cuda
+      CCACHE_DIR: /opt/build-cache/ccache
+      CCACHE_MAXSIZE: 100G
+      PATH: /usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          hostname
+          nproc
+          free -h
+          df -h / /opt/build-cache || true
+          nvcc --version
+          ccache --show-config | grep -E 'cache_dir|max_size'
+      - name: DiffusionGemma static audit
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import ast
+          import compileall
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path.cwd()
+          files = [
+              "python/sglang/srt/dllm/config.py",
+              "python/sglang/srt/dllm/algorithm/gemma4_renoise.py",
+              "python/sglang/srt/models/gemma4_diffusion.py",
+              "python/sglang/srt/multimodal/processors/diffusion_gemma.py",
+              "python/sglang/srt/configs/model_config.py",
+              "python/sglang/srt/configs/diffusion_gemma.py",
+              "python/sglang/srt/managers/scheduler.py",
+              "python/sglang/srt/model_executor/forward_batch_info.py",
+          ]
+          missing = [path for path in files if not (root / path).exists()]
+          if missing:
+              raise SystemExit(f"missing expected files: {missing}")
+
+          compiled = []
+          for rel in files:
+              path = root / rel
+              if not compileall.compile_file(str(path), quiet=1, force=True):
+                  raise SystemExit(f"compile failed: {rel}")
+              compiled.append(rel)
+
+          def parse(rel):
+              return ast.parse((root / rel).read_text(encoding="utf-8-sig"), filename=rel)
+
+          dllm_tree = parse("python/sglang/srt/dllm/config.py")
+          dllm_source = (root / "python/sglang/srt/dllm/config.py").read_text(encoding="utf-8")
+          for needle in [
+              '"DiffusionGemmaForBlockDiffusion"',
+              '"Gemma4Renoise"',
+              '"is_uniform": True',
+              'is_uniform = params["is_uniform"]',
+              "canvas_length",
+          ]:
+              if needle not in dllm_source:
+                  raise SystemExit(f"DllmConfig missing expected source marker: {needle}")
+
+          gemma_tree = parse("python/sglang/srt/models/gemma4_diffusion.py")
+          class_names = {
+              node.name for node in ast.walk(gemma_tree) if isinstance(node, ast.ClassDef)
+          }
+          required_classes = {
+              "DiffusionGemmaAttention",
+              "DiffusionGemmaDecoderLayer",
+              "DiffusionGemmaTextModel",
+              "DiffusionGemmaForBlockDiffusion",
+          }
+          missing_classes = sorted(required_classes - class_names)
+          if missing_classes:
+              raise SystemExit(f"gemma4_diffusion missing classes: {missing_classes}")
+
+          entry_classes = []
+          for path in sorted((root / "python/sglang/srt/models").glob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+              for node in tree.body:
+                  if (
+                      isinstance(node, ast.Assign)
+                      and any(
+                          isinstance(target, ast.Name) and target.id == "EntryClass"
+                          for target in node.targets
+                      )
+                      and isinstance(node.value, ast.Name)
+                  ):
+                      entry_classes.append((path.name, node.value.id))
+
+          dgemma_entries = [
+              item for item in entry_classes if item[1] == "DiffusionGemmaForBlockDiffusion"
+          ]
+          if dgemma_entries != [("gemma4_diffusion.py", "DiffusionGemmaForBlockDiffusion")]:
+              raise SystemExit(f"unexpected DiffusionGemma EntryClass entries: {dgemma_entries}")
+
+          fallback_source = (root / "python/sglang/srt/configs/diffusion_gemma.py").read_text(
+              encoding="utf-8"
+          )
+          for needle in [
+              "class DiffusionGemmaConfig",
+              'model_type = "diffusion_gemma"',
+              '"DiffusionGemmaForBlockDiffusion"',
+          ]:
+              if needle not in fallback_source:
+                  raise SystemExit(f"fallback config missing marker: {needle}")
+
+          processor_source = (
+              root / "python/sglang/srt/multimodal/processors/diffusion_gemma.py"
+          ).read_text(encoding="utf-8")
+          if "DiffusionGemmaForBlockDiffusion" not in processor_source:
+              raise SystemExit("multimodal processor is not bound to DiffusionGemma")
+
+          payload = {
+              "ok": True,
+              "compiled": compiled,
+              "dgemma_entry_classes": dgemma_entries,
+              "required_classes": sorted(required_classes),
+              "runner": "ubicloud-persistent-sglang-x64",
+              "scope": "static source/runtime audit only; no model weights, no serving claim",
+          }
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
