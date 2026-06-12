@@ -96,7 +96,7 @@ jobs:
           required_classes = {
               "DiffusionGemmaAttention",
               "DiffusionGemmaDecoderLayer",
-              "DiffusionGemmaTextModel",
+              "DiffusionGemmaModel",
               "DiffusionGemmaForBlockDiffusion",
           }
           missing_classes = sorted(required_classes - class_names)
