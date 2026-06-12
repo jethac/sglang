@@ -99,6 +99,20 @@ def _flashinfer_vo_split_head_dim_vo(head_dim_qk: int) -> int:
     return head_dim_qk
 
 
+def _target_verify_prefix_lens_for_paged_prefill(
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    seq_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if (
+        forward_mode.is_target_verify()
+        and spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.FROZEN_KV_MTP_VERIFY
+    ):
+        return seq_lens
+    return None
+
+
 def _trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -1989,6 +2003,12 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
+        verify_prefix_lens = _target_verify_prefix_lens_for_paged_prefill(
+            forward_mode,
+            spec_info,
+            seq_lens[:bs],
+        )
+
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -2007,7 +2027,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=verify_prefix_lens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -2079,7 +2099,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=_target_verify_prefix_lens_for_paged_prefill(
+                    forward_batch.forward_mode,
+                    forward_batch.spec_info,
+                    forward_batch.seq_lens,
+                ),
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
