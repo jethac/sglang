@@ -81,12 +81,15 @@ jobs:
       - name: Build wheel
         run: |
           set -euxo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install build wheel setuptools setuptools-scm setuptools-rust
+          VENV="$HOME/.cache/hijinks-build/venv"
+          python3 -m venv "$VENV"
+          . "$VENV/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install build wheel setuptools setuptools-scm setuptools-rust
           cd python
           cp ../README.md ../LICENSE .
           export SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0.dev0+g$(git rev-parse --short HEAD)"
-          python3 -m build --wheel
+          python -m build --wheel
           ls -lh dist/*.whl
 
       - name: Upload wheel artifact
