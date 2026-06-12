@@ -54,7 +54,28 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
+        run: |
+          set -euxo pipefail
+          PROTOC_ROOT="$HOME/.cache/hijinks-build/protoc"
+          if [ ! -x "$PROTOC_ROOT/bin/protoc" ]; then
+            ARCH="$(uname -m)"
+            if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+              PROTOC_ARCH="aarch_64"
+            else
+              PROTOC_ARCH="x86_64"
+            fi
+            PROTOC_ZIP="protoc-32.0-linux-${PROTOC_ARCH}.zip"
+            TMP_ZIP="/tmp/${PROTOC_ZIP}"
+            rm -rf "$PROTOC_ROOT"
+            mkdir -p "$PROTOC_ROOT"
+            curl -L --retry 5 --fail \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}" \
+              -o "$TMP_ZIP"
+            python3 -m zipfile -e "$TMP_ZIP" "$PROTOC_ROOT"
+            rm -f "$TMP_ZIP"
+          fi
+          echo "$PROTOC_ROOT/bin" >> "$GITHUB_PATH"
+          "$PROTOC_ROOT/bin/protoc" --version
 
       - name: Build wheel
         run: |
