@@ -14,7 +14,7 @@ permissions:
 jobs:
   x64:
     name: x64 runner smoke
-    runs-on: ubicloud-standard-8
+    runs-on: ubicloud-standard-30
     steps:
       - uses: actions/checkout@v4
       - name: Runner inventory
@@ -28,7 +28,7 @@ jobs:
 
   arm64:
     name: arm64 runner smoke
-    runs-on: ubicloud-standard-8-arm
+    runs-on: ubicloud-standard-30-arm
     steps:
       - uses: actions/checkout@v4
       - name: Runner inventory
