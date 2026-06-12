@@ -4321,15 +4321,28 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
-        # DiffusionGemma (uniform): head_dim 512 exceeds flashinfer's cap, and the
-        # bidirectional canvas attention needs triton with cuda-graph and chunked
-        # prefill disabled (the allow_bidirectional_attention_in_extend gate). Force
-        # these so a default launch works. Masked dLLMs keep the handling below.
+        # DiffusionGemma (uniform): keep the correctness-first cookbook default
+        # on Triton, but allow the campaign's explicit FlashInfer VO-split gate.
+        # D=512 globals require SGLANG_FLASHINFER_VOSPLIT=1; without that opt-in
+        # FlashInfer/FA3 still cannot serve the full-attention layers safely.
         if self.dllm_algorithm == "Gemma4Renoise":
-            if self.attention_backend != "triton":
+            dgemma_flashinfer_vosplit = (
+                self.attention_backend == "flashinfer"
+                and os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1"
+            )
+            if dgemma_flashinfer_vosplit:
+                logger.warning(
+                    "DiffusionGemma is using the experimental FlashInfer "
+                    "VO-split path because SGLANG_FLASHINFER_VOSPLIT=1 and "
+                    "--attention-backend flashinfer were both requested. This "
+                    "does not change the stock Triton cookbook default."
+                )
+            elif self.attention_backend != "triton":
                 logger.warning(
                     "Attention backend forced to triton for DiffusionGemma "
-                    "(head_dim 512 exceeds the flashinfer/fa3 cap)."
+                    "(set SGLANG_FLASHINFER_VOSPLIT=1 and "
+                    "--attention-backend flashinfer for the experimental "
+                    "FlashInfer D=512 VO-split path)."
                 )
                 self.attention_backend = "triton"
             self.disable_cuda_graph = True
