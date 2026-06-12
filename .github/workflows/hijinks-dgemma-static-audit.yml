@@ -128,8 +128,10 @@ jobs:
           )
           for needle in [
               "class DiffusionGemmaConfig",
+              "class DiffusionGemmaTextConfig",
+              "class DiffusionGemmaVisionConfig",
               'model_type = "diffusion_gemma"',
-              '"DiffusionGemmaForBlockDiffusion"',
+              "canvas_length",
           ]:
               if needle not in fallback_source:
                   raise SystemExit(f"fallback config missing marker: {needle}")
