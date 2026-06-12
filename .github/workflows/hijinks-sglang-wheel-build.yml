@@ -23,10 +23,6 @@ jobs:
     env:
       CCACHE_DIR: /opt/build-cache/ccache
       CCACHE_MAXSIZE: 100G
-      CARGO_HOME: /home/jethac/.cache/hijinks-build/cargo
-      RUSTUP_HOME: /home/jethac/.cache/hijinks-build/rustup
-      PIP_CACHE_DIR: /home/jethac/.cache/hijinks-build/pip
-      PATH: /home/jethac/.cache/hijinks-build/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +42,12 @@ jobs:
       - name: Prepare persistent build caches
         run: |
           set -euxo pipefail
-          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
+          CACHE_ROOT="$HOME/.cache/hijinks-build"
+          mkdir -p "$CACHE_ROOT/cargo" "$CACHE_ROOT/rustup" "$CACHE_ROOT/pip"
+          echo "CARGO_HOME=$CACHE_ROOT/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$CACHE_ROOT/rustup" >> "$GITHUB_ENV"
+          echo "PIP_CACHE_DIR=$CACHE_ROOT/pip" >> "$GITHUB_ENV"
+          echo "$CACHE_ROOT/cargo/bin" >> "$GITHUB_PATH"
           test -d "$CCACHE_DIR"
 
       - name: Install Rust toolchain
