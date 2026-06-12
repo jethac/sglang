@@ -11,6 +11,7 @@ on:
       - "python/sglang/srt/models/gemma4_diffusion.py"
       - "python/sglang/srt/multimodal/processors/diffusion_gemma.py"
       - "python/sglang/srt/configs/**"
+      - "python/sglang/srt/server_args.py"
 
 permissions:
   contents: read
@@ -56,6 +57,7 @@ jobs:
               "python/sglang/srt/configs/diffusion_gemma.py",
               "python/sglang/srt/managers/scheduler.py",
               "python/sglang/srt/model_executor/forward_batch_info.py",
+              "python/sglang/srt/server_args.py",
           ]
           missing = [path for path in files if not (root / path).exists()]
           if missing:
@@ -142,6 +144,22 @@ jobs:
           if "DiffusionGemmaForBlockDiffusion" not in processor_source:
               raise SystemExit("multimodal processor is not bound to DiffusionGemma")
 
+          server_args_source = (root / "python/sglang/srt/server_args.py").read_text(
+              encoding="utf-8"
+          )
+          for needle in [
+              'self.dllm_algorithm == "Gemma4Renoise"',
+              "dgemma_flashinfer_vosplit",
+              'self.attention_backend == "flashinfer"',
+              'os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1"',
+              "experimental FlashInfer VO-split path",
+              'self.attention_backend = "triton"',
+              "self.disable_cuda_graph = True",
+              "self.chunked_prefill_size = -1",
+          ]:
+              if needle not in server_args_source:
+                  raise SystemExit(f"server_args DiffusionGemma policy missing marker: {needle}")
+
           payload = {
               "ok": True,
               "compiled": compiled,
@@ -149,6 +167,7 @@ jobs:
               "required_classes": sorted(required_classes),
               "runner": "ubicloud-persistent-sglang-x64",
               "scope": "static source/runtime audit only; no model weights, no serving claim",
+              "dgr3_policy": "stock Gemma4Renoise stays Triton; FlashInfer requires SGLANG_FLASHINFER_VOSPLIT=1 plus --attention-backend flashinfer",
           }
           print(json.dumps(payload, indent=2, sort_keys=True))
           PY
