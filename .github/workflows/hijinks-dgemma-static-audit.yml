@@ -75,13 +75,19 @@ jobs:
           dllm_source = (root / "python/sglang/srt/dllm/config.py").read_text(encoding="utf-8")
           for needle in [
               '"DiffusionGemmaForBlockDiffusion"',
-              '"Gemma4Renoise"',
               '"is_uniform": True',
               'is_uniform = params["is_uniform"]',
               "canvas_length",
           ]:
               if needle not in dllm_source:
                   raise SystemExit(f"DllmConfig missing expected source marker: {needle}")
+
+          algorithm_source = (
+              root / "python/sglang/srt/dllm/algorithm/gemma4_renoise.py"
+          ).read_text(encoding="utf-8")
+          for needle in ["class Gemma4Renoise", "entropy", "renoise"]:
+              if needle not in algorithm_source:
+                  raise SystemExit(f"Gemma4Renoise missing expected marker: {needle}")
 
           gemma_tree = parse("python/sglang/srt/models/gemma4_diffusion.py")
           class_names = {
