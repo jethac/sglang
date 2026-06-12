@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolFP4
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -91,6 +91,20 @@ def _flashinfer_vo_split_head_dim_vo(head_dim_qk: int) -> int:
     if _flashinfer_vo_split_enabled() and head_dim_qk == 512:
         return 256
     return head_dim_qk
+
+
+def _target_verify_prefix_lens_for_paged_prefill(
+    forward_mode: ForwardMode,
+    spec_info: Optional[SpecInput],
+    seq_lens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if (
+        forward_mode.is_target_verify()
+        and spec_info is not None
+        and spec_info.spec_input_type == SpecInputType.FROZEN_KV_MTP_VERIFY
+    ):
+        return seq_lens
+    return None
 
 
 def _trace_k_scale_multipliers() -> List[float]:
@@ -2559,6 +2573,12 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
+        verify_prefix_lens = _target_verify_prefix_lens_for_paged_prefill(
+            forward_mode,
+            spec_info,
+            seq_lens[:bs],
+        )
+
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -2577,7 +2597,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=verify_prefix_lens,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
@@ -2639,7 +2659,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
-                prefix_lens=None,
+                prefix_lens=_target_verify_prefix_lens_for_paged_prefill(
+                    forward_batch.forward_mode,
+                    forward_batch.spec_info,
+                    forward_batch.seq_lens,
+                ),
                 prefill_wrappers=self.prefill_wrappers_verify,
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
