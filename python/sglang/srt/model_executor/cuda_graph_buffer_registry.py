@@ -455,6 +455,12 @@ class CudaGraphBufferRegistry:
                 cpu_dsts.append(dst)
                 cpu_srcs.append(src)
             else:
+                if dst.shape != src.shape:
+                    raise RuntimeError(
+                        f"GraphSlot {slot.name!r} copy shape mismatch: "
+                        f"dst={tuple(dst.shape)} src={tuple(src.shape)} "
+                        f"raw_bs={raw_bs} raw_num_tokens={raw_num_tokens}"
+                    )
                 gpu_dsts.append(dst)
                 gpu_srcs.append(src)
         if gpu_dsts:
