@@ -111,6 +111,30 @@ def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
         forward_batch.mrope_positions = positions.unsqueeze(0).repeat(3, 1)
 
 
+def set_frozen_kv_seed_out_cache_loc(
+    forward_batch: ForwardBatch, num_seed_tokens: int, topk: int
+) -> None:
+    out_cache_loc = forward_batch.out_cache_loc
+    if out_cache_loc is None or out_cache_loc.numel() == num_seed_tokens:
+        return
+
+    batch_tokens = num_seed_tokens // topk if topk > 1 else num_seed_tokens
+    if (
+        forward_batch.extend_seq_lens is not None
+        and out_cache_loc.numel() != batch_tokens
+    ):
+        last_indices = (
+            torch.cumsum(forward_batch.extend_seq_lens.to(torch.long), 0) - 1
+        )
+        out_cache_loc = out_cache_loc[last_indices]
+    else:
+        out_cache_loc = out_cache_loc[-batch_tokens:]
+
+    if topk > 1:
+        out_cache_loc = out_cache_loc.repeat_interleave(topk)
+    forward_batch.out_cache_loc = out_cache_loc
+
+
 def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
     """Repeat committed-prefix metadata for the active ``B * topk`` frontier."""
     if topk == 1 or forward_batch.batch_size == 0:
