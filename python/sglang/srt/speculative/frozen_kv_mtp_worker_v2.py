@@ -57,6 +57,7 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     frozen_kv_target_view,
     position_for_batch,
     select_last_extend_hidden,
+    set_frozen_kv_seed_out_cache_loc,
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
@@ -508,6 +509,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             seed_prev_hidden = target_hidden
 
         forward_batch.input_ids = seed_input_ids
+        set_frozen_kv_seed_out_cache_loc(
+            forward_batch, seed_input_ids.shape[0], self.topk
+        )
         forward_batch.spec_info.hidden_states = seed_prev_hidden
         self._set_positions(forward_batch)
 
