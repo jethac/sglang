@@ -72,6 +72,7 @@ jobs:
               "https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}" \
               -o "$TMP_ZIP"
             python3 -m zipfile -e "$TMP_ZIP" "$PROTOC_ROOT"
+            chmod +x "$PROTOC_ROOT/bin/protoc"
             rm -f "$TMP_ZIP"
           fi
           echo "$PROTOC_ROOT/bin" >> "$GITHUB_PATH"
