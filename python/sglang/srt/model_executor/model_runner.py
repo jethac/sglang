@@ -2776,6 +2776,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _calibrate_nvfp4_kv_cache(self) -> None:
         """Run one eager prefill to freeze NVFP4 KV global scales before capture."""
+        if self.is_draft_worker and self.spec_algorithm.is_frozen_kv_mtp():
+            logger.info(
+                "Skipping NVFP4 KV cache calibration for Frozen-KV MTP draft "
+                "worker; the assistant reads the already-calibrated target KV cache."
+            )
+            return
+
         fp4_pools = self._get_nvfp4_native_kv_pools()
         if not fp4_pools:
             return
