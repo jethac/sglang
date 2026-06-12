@@ -1,0 +1,41 @@
+name: hijinks-ubicloud-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - spark/hijinks-024-diffusiongemma-upstream-rebase
+    paths:
+      - ".github/workflows/hijinks-ubicloud-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    name: x64 runner smoke
+    runs-on: ubicloud-standard-8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu | sed -n '1,20p'
+          nproc
+          free -h
+          df -h /
+
+  arm64:
+    name: arm64 runner smoke
+    runs-on: ubicloud-standard-8-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu | sed -n '1,20p'
+          nproc
+          free -h
+          df -h /
