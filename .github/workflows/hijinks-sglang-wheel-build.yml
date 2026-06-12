@@ -43,6 +43,12 @@ jobs:
           nvcc --version || true
           ccache --show-config | grep -E 'cache_dir|max_size' || true
 
+      - name: Prepare persistent build caches
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p "$CCACHE_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
+          sudo chown -R "$(id -u):$(id -g)" "$CCACHE_DIR" "$CARGO_HOME" "$RUSTUP_HOME" "$PIP_CACHE_DIR"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -66,4 +72,3 @@ jobs:
           name: sglang-wheel-${{ github.sha }}
           path: python/dist/*.whl
           retention-days: 14
-
