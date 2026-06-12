@@ -107,6 +107,8 @@ def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
             forward_batch.positions.copy_(positions)
         else:
             forward_batch.positions = positions
+    if forward_batch.mrope_positions is not None:
+        forward_batch.mrope_positions = positions.unsqueeze(0).repeat(3, 1)
 
 
 def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
