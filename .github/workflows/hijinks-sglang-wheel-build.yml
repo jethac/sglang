@@ -1,0 +1,69 @@
+name: hijinks-sglang-wheel-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - spark/hijinks-024-diffusiongemma-upstream-rebase
+    paths:
+      - ".github/workflows/hijinks-sglang-wheel-build.yml"
+      - "python/**"
+      - "rust/**"
+      - "README.md"
+      - "LICENSE"
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Build SGLang wheel on persistent runner
+    runs-on: [self-hosted, Linux, X64, ubicloud-persistent-build-x64, sglang-wheel]
+    timeout-minutes: 45
+    env:
+      CCACHE_DIR: /opt/build-cache/ccache
+      CCACHE_MAXSIZE: 100G
+      CARGO_HOME: /opt/build-cache/cargo
+      RUSTUP_HOME: /opt/build-cache/rustup
+      PIP_CACHE_DIR: /opt/build-cache/pip
+      PATH: /opt/build-cache/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Runner inventory
+        run: |
+          set -euxo pipefail
+          hostname
+          nproc
+          free -h
+          df -h / /opt/build-cache || true
+          python3 --version
+          nvcc --version || true
+          ccache --show-config | grep -E 'cache_dir|max_size' || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Build wheel
+        run: |
+          set -euxo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install build wheel setuptools setuptools-scm setuptools-rust
+          cd python
+          cp ../README.md ../LICENSE .
+          export SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0.dev0+g$(git rev-parse --short HEAD)"
+          python3 -m build --wheel
+          ls -lh dist/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-wheel-${{ github.sha }}
+          path: python/dist/*.whl
+          retention-days: 14
+
