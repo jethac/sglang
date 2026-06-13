@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
 import torch
 
@@ -101,6 +101,13 @@ def _flashinfer_vo_split_head_dim_vo(head_dim_qk: int) -> int:
     if _flashinfer_vo_split_enabled() and head_dim_qk == 512:
         return 256
     return head_dim_qk
+
+
+def _is_gemma4_model(model_config) -> bool:
+    architectures = getattr(
+        getattr(model_config, "hf_config", None), "architectures", None
+    )
+    return bool(architectures and "Gemma4ForConditionalGeneration" in architectures)
 
 
 def _target_verify_prefix_lens_for_paged_prefill(
@@ -956,6 +963,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self._geometry_trace_seen = set()
         self.wrapper_geometries = _flashinfer_wrapper_geometries(
             model_runner.model_config, self.dispatch_reason, self.num_wrappers
+        )
+        self.enable_gemma4_mm_prefix_mask = (
+            self.is_multimodal
+            and _is_gemma4_model(model_runner.model_config)
+            and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
         )
         if _gemma4_geometry_trace_enabled():
             logger.warning(
@@ -2159,6 +2171,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                mm_inputs=(
+                    forward_batch.mm_inputs
+                    if self.enable_gemma4_mm_prefix_mask
+                    else None
+                ),
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -3040,6 +3057,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self._gemma4_mm_prefix_mask_logged = False
+        self._gemma4_mm_prefix_split_warned = False
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -3064,6 +3083,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        mm_inputs: Optional[Sequence] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -3082,6 +3102,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        mm_inputs: Optional[Sequence] = None,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -3109,6 +3130,7 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             wrapper_id=0,
+            mm_inputs=mm_inputs,
         )
 
     def update_sliding_window(
@@ -3125,6 +3147,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        mm_inputs: Optional[Sequence] = None,
     ):
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
@@ -3189,6 +3212,7 @@ class FlashInferIndicesUpdaterPrefill:
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
                 wrapper_id=wrapper_id,
+                mm_inputs=mm_inputs if wrapper_id == 0 else None,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -3232,6 +3256,98 @@ class FlashInferIndicesUpdaterPrefill:
             return None
         return torch.cat(mask_parts)
 
+    def _build_gemma4_mm_prefix_custom_mask(
+        self,
+        mm_inputs: Sequence,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        kv_start_idx: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """FlashInfer Gemma 4 image-prefix mask for SWA paged prefill.
+
+        FlashInfer consumes one flat unpacked custom mask over each request's
+        effective [extend queries x paged keys] block. The base mask is causal;
+        image-token spans are made bidirectional only inside the same image item.
+        """
+        if kv_start_idx is None:
+            return None
+
+        seq_lens_cpu = seq_lens.detach().cpu().tolist()
+        prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
+        kv_start_cpu = kv_start_idx.detach().cpu().tolist()
+        paged_lens_cpu = paged_kernel_lens.detach().cpu().tolist()
+
+        device = seq_lens.device
+        mask_parts: List[torch.Tensor] = []
+        need_mask = False
+        split_images = []
+
+        for i, (seq_len, prefix_len, kv_start, paged_len) in enumerate(
+            zip(seq_lens_cpu, prefix_lens_cpu, kv_start_cpu, paged_lens_cpu)
+        ):
+            seq_len = int(seq_len)
+            prefix_len = int(prefix_len)
+            kv_start = int(kv_start)
+            paged_len = int(paged_len)
+            extend_len = seq_len - prefix_len
+            if extend_len <= 0 or paged_len <= 0:
+                continue
+
+            q_abs = torch.arange(extend_len, device=device).view(-1, 1) + prefix_len
+            k_abs = torch.arange(paged_len, device=device).view(1, -1) + kv_start
+            mask = k_abs <= q_abs
+
+            mm_input = mm_inputs[i] if i < len(mm_inputs) else None
+            if mm_input is not None:
+                for mm_item in mm_input.mm_items:
+                    if not mm_item.is_image():
+                        continue
+                    for im_begin, im_end in mm_item.offsets:
+                        im_begin = int(im_begin)
+                        im_end = int(im_end)
+                        intersects_q = im_end >= prefix_len and im_begin < seq_len
+                        intersects_k = (
+                            im_end >= kv_start and im_begin < kv_start + paged_len
+                        )
+                        if not (intersects_q and intersects_k):
+                            continue
+
+                        in_q = (q_abs >= im_begin) & (q_abs <= im_end)
+                        in_k = (k_abs >= im_begin) & (k_abs <= im_end)
+                        image_block = in_q & in_k
+                        if bool((image_block & ~mask).any()):
+                            need_mask = True
+                        mask |= image_block
+
+                        if (
+                            im_begin < prefix_len
+                            or im_end >= seq_len
+                            or im_begin < kv_start
+                            or im_end >= kv_start + paged_len
+                        ):
+                            split_images.append((i, im_begin, im_end))
+
+            mask_parts.append(mask.reshape(-1))
+
+        if not need_mask or not mask_parts:
+            return None
+        if not self._gemma4_mm_prefix_mask_logged:
+            self._gemma4_mm_prefix_mask_logged = True
+            logger.warning(
+                "Gemma 4 FlashInfer image-prefix custom mask active for SWA "
+                "paged prefill."
+            )
+        if split_images and not self._gemma4_mm_prefix_split_warned:
+            self._gemma4_mm_prefix_split_warned = True
+            logger.warning(
+                "Gemma 4 image spans partially crossed a FlashInfer SWA "
+                "prefill window/chunk; applied bidirectional attention to "
+                "the visible image tokens only. First split spans: %s",
+                split_images[:5],
+            )
+        return torch.cat(mask_parts)
+
     def update_cross_attention(
         self,
         req_pool_indices: torch.Tensor,
@@ -3246,6 +3362,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        mm_inputs: Optional[Sequence] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -3278,6 +3395,7 @@ class FlashInferIndicesUpdaterPrefill:
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
                 wrapper_id=wrapper_id,
+                mm_inputs=mm_inputs if wrapper_id == 0 else None,
             )
 
     def call_begin_forward(
@@ -3299,6 +3417,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         wrapper_id: int = 0,
+        mm_inputs: Optional[Sequence] = None,
     ):
         bs = len(seq_lens)
         geom = self.wrapper_geometries[wrapper_id]
@@ -3326,6 +3445,19 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
 
             custom_mask = cross_attention_custom_mask
+            if (
+                custom_mask is None
+                and mm_inputs is not None
+                and wrapper_id == 0
+                and not use_ragged
+            ):
+                custom_mask = self._build_gemma4_mm_prefix_custom_mask(
+                    mm_inputs,
+                    seq_lens,
+                    prefix_lens,
+                    kv_start_idx,
+                    paged_kernel_lens,
+                )
         else:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:

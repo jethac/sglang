@@ -313,11 +313,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
         tokens), not across items.
-        Currently only the TritonAttnBackend supports this.
+        Triton applies this after metadata setup; FlashInfer applies the same
+        image-span mask while planning paged prefill.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(get_attn_backend(), TritonAttnBackend):
+        attn_backend = get_attn_backend()
+        if not isinstance(attn_backend, TritonAttnBackend):
+            if type(attn_backend).__name__ == "FlashInferAttnBackend":
+                return
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
