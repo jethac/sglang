@@ -75,6 +75,10 @@ def _fp4_kv_merge_state_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_MERGE_STATE") == "1"
 
 
+def _fp4_kv_module_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_MODULE") == "1"
+
+
 def _fp4_kv_prefix_ref_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_PREFIX_REF") == "1"
 
