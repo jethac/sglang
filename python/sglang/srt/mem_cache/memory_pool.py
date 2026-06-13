@@ -97,6 +97,10 @@ def _fp4_kv_trace_quant_error_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_QUANT_ERROR") == "1"
 
 
+def _fp4_kv_trace_sf_saturation_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_SF_SATURATION") == "1"
+
+
 def _fp4_kv_mixed_kv_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_MIXED_KV") == "1"
 
@@ -218,6 +222,36 @@ def _fp4_kv_trace_numeric_stats(x: torch.Tensor, limit: Optional[int] = None):
     except Exception as exc:
         summary["stats_error"] = repr(exc)
     return summary
+
+
+def _fp4_kv_trace_sf_saturation_stats(x: Optional[torch.Tensor]):
+    if x is None:
+        return None
+    stats = _fp4_kv_trace_tensor_summary(x)
+    try:
+        work = x.detach().float()
+        finite = torch.isfinite(work)
+        finite_count = int(finite.sum().detach().cpu().item())
+        stats["numel"] = int(work.numel())
+        stats["finite_count"] = finite_count
+        if work.numel() > 0 and finite_count > 0:
+            finite_values = work[finite]
+            at_max = finite_values >= 448.0
+            near_max = finite_values >= 440.0
+            stats["min"] = float(finite_values.min().detach().cpu().item())
+            stats["max"] = float(finite_values.max().detach().cpu().item())
+            stats["mean"] = float(finite_values.mean().detach().cpu().item())
+            stats["count_ge_440"] = int(near_max.sum().detach().cpu().item())
+            stats["count_ge_448"] = int(at_max.sum().detach().cpu().item())
+            stats["share_ge_440"] = (
+                stats["count_ge_440"] / finite_count if finite_count else 0.0
+            )
+            stats["share_ge_448"] = (
+                stats["count_ge_448"] / finite_count if finite_count else 0.0
+            )
+    except Exception as exc:
+        stats["stats_error"] = repr(exc)
+    return stats
 
 
 def _fp4_kv_trace_compare_tensors(a: torch.Tensor, b: torch.Tensor):
@@ -2095,6 +2129,34 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 exc,
             )
 
+    def _trace_fp4_kv_sf_saturation(
+        self,
+        *,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k_fp4_sf: Optional[torch.Tensor],
+        cache_v_fp4_sf: torch.Tensor,
+    ):
+        if not _fp4_kv_trace_sf_saturation_enabled() or not _fp4_kv_trace_layer_enabled(
+            layer_id
+        ):
+            return
+
+        local_layer_id = layer_id - self.start_layer
+        logger.warning(
+            "FP4 KV SF saturation trace %s",
+            {
+                "layer": int(layer_id),
+                "local_layer": int(local_layer_id),
+                "loc_len": int(loc.numel()),
+                "k_global": float(self.k_global_float[local_layer_id]),
+                "v_global": float(self.v_global_float[local_layer_id]),
+                "mixed_fp8_k_nvfp4_v": bool(self.mixed_fp8_k_nvfp4_v),
+                "k_sf": _fp4_kv_trace_sf_saturation_stats(cache_k_fp4_sf),
+                "v_sf": _fp4_kv_trace_sf_saturation_stats(cache_v_fp4_sf),
+            },
+        )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2129,6 +2191,13 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             )
         cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             dense_cache_v, v_global
+        )
+
+        self._trace_fp4_kv_sf_saturation(
+            layer_id=layer_id,
+            loc=loc,
+            cache_k_fp4_sf=cache_k_fp4_sf,
+            cache_v_fp4_sf=cache_v_fp4_sf,
         )
 
         if cache_k_fp4_sf is not None:
