@@ -944,6 +944,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+        self._apply_nvfp4_kv_calibration()
 
         # Snapshot free memory at the end of the weight-load phase. KV-pool
         # profiling uses this instead of measuring at alloc_memory_pool()
@@ -2486,6 +2487,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+    def _apply_nvfp4_kv_calibration(self) -> None:
+        if self.server_args.kv_cache_dtype != "fp4_e2m1":
+            return
+        try:
+            from sglang.srt.layers.quantization.nvfp4_kv_calib import (
+                calibrated_kv_global_scales,
+            )
+            from sglang.srt.layers.radix_attention import RadixAttention
+        except Exception as exc:
+            logger.warning("NVFP4 KV calibration loader unavailable: %r", exc)
+            return
+
+        calibration = calibrated_kv_global_scales(self.model_config.hf_config)
+        if calibration is None:
+            return
+
+        applied = 0
+        for module in self.model.modules():
+            if not isinstance(module, RadixAttention):
+                continue
+            module.k_scale_float = calibration.k_global_scale
+            module.v_scale_float = calibration.v_global_scale
+            applied += 1
+
+        if applied == 0:
+            logger.warning(
+                "NVFP4 KV calibration %s matched %s but found no RadixAttention "
+                "layers to update",
+                calibration.source,
+                calibration.arch_signature,
+            )
+            return
+        logger.info(
+            "NVFP4 KV calibration applied: arch_signature=%s "
+            "k_global_scale=%s v_global_scale=%s layers=%d source=%s",
+            calibration.arch_signature,
+            calibration.k_global_scale,
+            calibration.v_global_scale,
+            applied,
+            calibration.source,
+        )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
