@@ -913,10 +913,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
-        self._apply_nvfp4_kv_calibration()
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+        self._apply_nvfp4_kv_calibration()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_device_graphs so warmup
@@ -2440,29 +2440,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if calibration is None:
             return
 
-        applied = 0
+        layer_count = 0
         for module in self.model.modules():
             if not isinstance(module, RadixAttention):
                 continue
             module.k_scale_float = calibration.k_global_scale
             module.v_scale_float = calibration.v_global_scale
-            applied += 1
+            layer_count += 1
 
-        if applied == 0:
+        pool_count = 0
+        if hasattr(self, "token_to_kv_pool"):
+            for pool in self._get_nvfp4_native_kv_pools():
+                if not getattr(pool, "mixed_fp8_k_nvfp4_v", False):
+                    pool.k_global.fill_(calibration.k_global_scale)
+                    pool.k_global_float = [
+                        calibration.k_global_scale for _ in range(pool.layer_num)
+                    ]
+                pool.v_global.fill_(calibration.v_global_scale)
+                pool.v_global_float = [
+                    calibration.v_global_scale for _ in range(pool.layer_num)
+                ]
+                pool._gs_calibrated = [True for _ in range(pool.layer_num)]
+                pool_count += 1
+
+        if layer_count == 0 and pool_count == 0:
             logger.warning(
                 "NVFP4 KV calibration %s matched %s but found no RadixAttention "
-                "layers to update",
+                "layers or FP4 KV pools to update",
                 calibration.source,
                 calibration.arch_signature,
             )
             return
         logger.info(
             "NVFP4 KV calibration applied: arch_signature=%s "
-            "k_global_scale=%s v_global_scale=%s layers=%d source=%s",
+            "k_global_scale=%s v_global_scale=%s layers=%d pools=%d source=%s",
             calibration.arch_signature,
             calibration.k_global_scale,
             calibration.v_global_scale,
-            applied,
+            layer_count,
+            pool_count,
             calibration.source,
         )
 
