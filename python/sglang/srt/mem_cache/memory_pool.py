@@ -130,6 +130,16 @@ def _fp4_kv_global_scale_multiplier(kind: str) -> float:
     return 1.0
 
 
+_FP4_KV_SIDECAR_FIXED_GLOBAL_SCALE = {"k": None, "v": None}
+
+
+def set_fp4_kv_sidecar_global_scales(
+    k_scale: Optional[float], v_scale: Optional[float]
+) -> None:
+    _FP4_KV_SIDECAR_FIXED_GLOBAL_SCALE["k"] = k_scale
+    _FP4_KV_SIDECAR_FIXED_GLOBAL_SCALE["v"] = v_scale
+
+
 def _fp4_kv_fixed_global_scale(kind: str) -> Optional[float]:
     keys = [
         f"SGLANG_FP4_KV_{kind.upper()}_FIXED_GLOBAL_SCALE",
@@ -148,7 +158,7 @@ def _fp4_kv_fixed_global_scale(kind: str) -> Optional[float]:
             logger.warning("Ignoring non-positive %s=%r", key, raw)
             continue
         return value
-    return None
+    return _FP4_KV_SIDECAR_FIXED_GLOBAL_SCALE.get(kind)
 
 
 def _fp4_kv_global_scale_policy(kind: str) -> str:

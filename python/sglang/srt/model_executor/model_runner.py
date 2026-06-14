@@ -2445,19 +2445,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(self, "token_to_kv_pool")
             else []
         )
-        pool_count = 0
-        for pool in fp4_pools:
-            if not getattr(pool, "mixed_fp8_k_nvfp4_v", False):
-                pool.k_global.fill_(calibration.k_global_scale)
-                pool.k_global_float = [
-                    calibration.k_global_scale for _ in range(pool.layer_num)
-                ]
-            pool.v_global.fill_(calibration.v_global_scale)
-            pool.v_global_float = [
-                calibration.v_global_scale for _ in range(pool.layer_num)
-            ]
-            pool._gs_calibrated = [True for _ in range(pool.layer_num)]
-            pool_count += 1
+        pool_count = len(fp4_pools)
+        if pool_count > 0:
+            from sglang.srt.mem_cache.memory_pool import (
+                set_fp4_kv_sidecar_global_scales,
+            )
+
+            set_fp4_kv_sidecar_global_scales(
+                calibration.k_global_scale, calibration.v_global_scale
+            )
 
         layer_count = 0
         if pool_count == 0:
