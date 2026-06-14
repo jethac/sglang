@@ -153,6 +153,56 @@ def _fp4_kv_fixed_global_scale(kind: str) -> Optional[float]:
     return None
 
 
+def _fp4_kv_global_scale_policy(kind: str) -> str:
+    keys = [
+        f"SGLANG_FP4_KV_{kind.upper()}_GLOBAL_SCALE_POLICY",
+        "SGLANG_FP4_KV_GLOBAL_SCALE_POLICY",
+    ]
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw not in (None, ""):
+            return raw.strip().lower()
+    return "amax"
+
+
+def _fp4_kv_apply_global_scale_policy(
+    kind: str, amax_scale: torch.Tensor
+) -> Tuple[torch.Tensor, str, Optional[float]]:
+    policy = _fp4_kv_global_scale_policy(kind)
+    if policy in ("amax", "auto", "legacy_amax", "amax_legacy"):
+        return amax_scale, "amax", None
+    if policy in ("fixed_literal_0p1", "fixed_0p1", "literal_0p1"):
+        value = 0.1
+    elif policy.startswith("fixed_literal:"):
+        try:
+            value = float(policy.split(":", 1)[1])
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid SGLANG_FP4_KV_%s_GLOBAL_SCALE_POLICY=%r",
+                kind.upper(),
+                policy,
+            )
+            return amax_scale, "amax", None
+    else:
+        logger.warning(
+            "Ignoring unsupported SGLANG_FP4_KV_%s_GLOBAL_SCALE_POLICY=%r; "
+            "expected amax, fixed_literal_0p1, or fixed_literal:<positive-float>",
+            kind.upper(),
+            policy,
+        )
+        return amax_scale, "amax", None
+    if value <= 0.0:
+        logger.warning(
+            "Ignoring non-positive SGLANG_FP4_KV_%s_GLOBAL_SCALE_POLICY=%r",
+            kind.upper(),
+            policy,
+        )
+        return amax_scale, "amax", None
+    selected = torch.empty_like(amax_scale)
+    selected.fill_(value)
+    return selected, policy, value
+
+
 def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -2074,8 +2124,14 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         denom = E2M1_MAX * MAX_BLOCK_SCALE_FP8
         k_amax = cache_k.detach().abs().amax().float()
         v_amax = cache_v.detach().abs().amax().float()
-        k_gs = (k_amax / denom).clamp_(min=1e-8)
-        v_gs = (v_amax / denom).clamp_(min=1e-8)
+        k_gs_amax = (k_amax / denom).clamp_(min=1e-8)
+        v_gs_amax = (v_amax / denom).clamp_(min=1e-8)
+        k_gs, k_gs_policy, k_policy_literal = _fp4_kv_apply_global_scale_policy(
+            "k", k_gs_amax
+        )
+        v_gs, v_gs_policy, v_policy_literal = _fp4_kv_apply_global_scale_policy(
+            "v", v_gs_amax
+        )
         k_gs_multiplier = _fp4_kv_global_scale_multiplier("k")
         v_gs_multiplier = _fp4_kv_global_scale_multiplier("v")
         k_fixed_global_scale = _fp4_kv_fixed_global_scale("k")
@@ -2096,14 +2152,22 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         if not explicit_autocalib or _fp4_kv_trace_global_scale_enabled():
             logger.info(
                 "NVFP4 KV auto-calibrated layer %d: k_amax=%.4g v_amax=%.4g "
-                "k_gs=%.4g v_gs=%.4g k_gs_multiplier=%.4g "
+                "k_gs_amax=%.4g v_gs_amax=%.4g k_gs=%.4g v_gs=%.4g "
+                "k_gs_policy=%s v_gs_policy=%s k_policy_literal=%s "
+                "v_policy_literal=%s k_gs_multiplier=%.4g "
                 "v_gs_multiplier=%.4g k_fixed_global_scale=%s "
                 "v_fixed_global_scale=%s (n_tokens=%d)",
                 layer_id,
                 float(k_amax),
                 float(v_amax),
+                float(k_gs_amax),
+                float(v_gs_amax),
                 self.k_global_float[local_layer_id],
                 self.v_global_float[local_layer_id],
+                k_gs_policy,
+                v_gs_policy,
+                k_policy_literal,
+                v_policy_literal,
                 k_gs_multiplier,
                 v_gs_multiplier,
                 k_fixed_global_scale,
