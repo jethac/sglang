@@ -2440,28 +2440,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if calibration is None:
             return
 
-        layer_count = 0
-        for module in self.model.modules():
-            if not isinstance(module, RadixAttention):
-                continue
-            module.k_scale_float = calibration.k_global_scale
-            module.v_scale_float = calibration.v_global_scale
-            layer_count += 1
-
+        fp4_pools = (
+            self._get_nvfp4_native_kv_pools()
+            if hasattr(self, "token_to_kv_pool")
+            else []
+        )
         pool_count = 0
-        if hasattr(self, "token_to_kv_pool"):
-            for pool in self._get_nvfp4_native_kv_pools():
-                if not getattr(pool, "mixed_fp8_k_nvfp4_v", False):
-                    pool.k_global.fill_(calibration.k_global_scale)
-                    pool.k_global_float = [
-                        calibration.k_global_scale for _ in range(pool.layer_num)
-                    ]
-                pool.v_global.fill_(calibration.v_global_scale)
-                pool.v_global_float = [
-                    calibration.v_global_scale for _ in range(pool.layer_num)
+        for pool in fp4_pools:
+            if not getattr(pool, "mixed_fp8_k_nvfp4_v", False):
+                pool.k_global.fill_(calibration.k_global_scale)
+                pool.k_global_float = [
+                    calibration.k_global_scale for _ in range(pool.layer_num)
                 ]
-                pool._gs_calibrated = [True for _ in range(pool.layer_num)]
-                pool_count += 1
+            pool.v_global.fill_(calibration.v_global_scale)
+            pool.v_global_float = [
+                calibration.v_global_scale for _ in range(pool.layer_num)
+            ]
+            pool._gs_calibrated = [True for _ in range(pool.layer_num)]
+            pool_count += 1
+
+        layer_count = 0
+        if pool_count == 0:
+            for module in self.model.modules():
+                if not isinstance(module, RadixAttention):
+                    continue
+                module.k_scale_float = calibration.k_global_scale
+                module.v_scale_float = calibration.v_global_scale
+                layer_count += 1
 
         if layer_count == 0 and pool_count == 0:
             logger.warning(
