@@ -132,6 +132,27 @@ def _fp4_kv_global_scale_multiplier(kind: str) -> float:
     return 1.0
 
 
+def _fp4_kv_fixed_global_scale(kind: str) -> Optional[float]:
+    keys = [
+        f"SGLANG_FP4_KV_{kind.upper()}_FIXED_GLOBAL_SCALE",
+        "SGLANG_FP4_KV_FIXED_GLOBAL_SCALE",
+    ]
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid %s=%r", key, raw)
+            continue
+        if value <= 0:
+            logger.warning("Ignoring non-positive %s=%r", key, raw)
+            continue
+        return value
+    return None
+
+
 def _fp4_kv_trace_layer_enabled(layer_id: int) -> bool:
     raw = os.environ.get("SGLANG_FP4_KV_TRACE_LAYERS")
     if raw in (None, ""):
@@ -2057,10 +2078,16 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_gs = (v_amax / denom).clamp_(min=1e-8)
         k_gs_multiplier = _fp4_kv_global_scale_multiplier("k")
         v_gs_multiplier = _fp4_kv_global_scale_multiplier("v")
+        k_fixed_global_scale = _fp4_kv_fixed_global_scale("k")
+        v_fixed_global_scale = _fp4_kv_fixed_global_scale("v")
         if k_gs_multiplier != 1.0:
             k_gs = k_gs * k_gs_multiplier
         if v_gs_multiplier != 1.0:
             v_gs = v_gs * v_gs_multiplier
+        if k_fixed_global_scale is not None:
+            k_gs.fill_(k_fixed_global_scale)
+        if v_fixed_global_scale is not None:
+            v_gs.fill_(v_fixed_global_scale)
         self.k_global[local_layer_id].copy_(k_gs)
         self.v_global[local_layer_id].copy_(v_gs)
         self.k_global_float[local_layer_id] = float(k_gs)
@@ -2070,7 +2097,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             logger.info(
                 "NVFP4 KV auto-calibrated layer %d: k_amax=%.4g v_amax=%.4g "
                 "k_gs=%.4g v_gs=%.4g k_gs_multiplier=%.4g "
-                "v_gs_multiplier=%.4g (n_tokens=%d)",
+                "v_gs_multiplier=%.4g k_fixed_global_scale=%s "
+                "v_fixed_global_scale=%s (n_tokens=%d)",
                 layer_id,
                 float(k_amax),
                 float(v_amax),
@@ -2078,6 +2106,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 self.v_global_float[local_layer_id],
                 k_gs_multiplier,
                 v_gs_multiplier,
+                k_fixed_global_scale,
+                v_fixed_global_scale,
                 cache_k.shape[0],
             )
 
