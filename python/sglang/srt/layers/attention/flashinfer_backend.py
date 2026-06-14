@@ -30,7 +30,11 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPoolFP4
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    KVWriteLoc,
+    MHATokenToKVPoolFP4,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -81,6 +85,10 @@ def _fp4_kv_module_trace_enabled() -> bool:
 
 def _fp4_kv_prefix_ref_trace_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_TRACE_PREFIX_REF") == "1"
+
+
+def _fp4_kv_global_scale_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_GLOBAL_SCALE") == "1"
 
 
 def _fp4_kv_dense_cache_trace_enabled() -> bool:
@@ -449,6 +457,8 @@ global_override_indptr_cpu = None
 def _is_nvfp4_native_kv_pool(token_to_kv_pool) -> bool:
     if isinstance(token_to_kv_pool, MHATokenToKVPoolFP4):
         return True
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return isinstance(token_to_kv_pool.full_kv_pool, MHATokenToKVPoolFP4)
     return (
         isinstance(token_to_kv_pool, SWAKVPool)
         and isinstance(token_to_kv_pool.full_kv_pool, MHATokenToKVPoolFP4)
@@ -459,6 +469,10 @@ def _is_nvfp4_native_kv_pool(token_to_kv_pool) -> bool:
 def _is_fp8_k_nvfp4_v_pool(token_to_kv_pool) -> bool:
     if isinstance(token_to_kv_pool, MHATokenToKVPoolFP4):
         return bool(getattr(token_to_kv_pool, "mixed_fp8_k_nvfp4_v", False))
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return bool(
+            getattr(token_to_kv_pool.full_kv_pool, "mixed_fp8_k_nvfp4_v", False)
+        )
     return (
         isinstance(token_to_kv_pool, SWAKVPool)
         and bool(
@@ -469,6 +483,11 @@ def _is_fp8_k_nvfp4_v_pool(token_to_kv_pool) -> bool:
 
 
 def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return (
+            token_to_kv_pool.full_kv_pool,
+            token_to_kv_pool._transfer_full_attention_id(layer_id),
+        )
     if not isinstance(token_to_kv_pool, SWAKVPool):
         return token_to_kv_pool, layer_id
 
@@ -1649,6 +1668,43 @@ class FlashInferAttnBackend(AttentionBackend):
         k_sf = _shape_nvfp4_kv_scale_for_flashinfer(k_sf)
         v_sf = _shape_nvfp4_kv_scale_for_flashinfer(v_sf)
         k_global, v_global = kv_pool.get_kv_global_scale(local_layer_id)
+        if _fp4_kv_global_scale_trace_enabled():
+            seen = getattr(self, "_nvfp4_global_scale_trace_seen", None)
+            if seen is None:
+                seen = self._nvfp4_global_scale_trace_seen = set()
+            key = (int(layer.layer_id), int(local_layer_id))
+            if key not in seen:
+                seen.add(key)
+                try:
+                    k_global_tensor = kv_pool.k_global[local_layer_id]
+                    v_global_tensor = kv_pool.v_global[local_layer_id]
+                except Exception:
+                    k_global_tensor = None
+                    v_global_tensor = None
+                logger.info(
+                    "NVFP4 KV global-scale read/write trace layer=%s "
+                    "local_layer=%s pool=%s mixed_fp8_k_nvfp4_v=%s "
+                    "layer_k_scale_float=%s layer_v_scale_float=%s "
+                    "pool_k_global_float=%s pool_v_global_float=%s "
+                    "pool_k_global_tensor=%s pool_v_global_tensor=%s "
+                    "flashinfer_k_scale=%s flashinfer_v_scale=%s",
+                    layer.layer_id,
+                    local_layer_id,
+                    type(kv_pool).__name__,
+                    getattr(kv_pool, "mixed_fp8_k_nvfp4_v", None),
+                    _scale_trace_value(getattr(layer, "k_scale_float", None)),
+                    _scale_trace_value(getattr(layer, "v_scale_float", None)),
+                    _scale_trace_value(getattr(kv_pool, "k_global_float", [None])[
+                        local_layer_id
+                    ]),
+                    _scale_trace_value(getattr(kv_pool, "v_global_float", [None])[
+                        local_layer_id
+                    ]),
+                    _scale_trace_value(k_global_tensor),
+                    _scale_trace_value(v_global_tensor),
+                    _scale_trace_value(k_global),
+                    _scale_trace_value(v_global),
+                )
         return kv_cache, {
             "kv_cache_sf": (k_sf, v_sf),
             "k_scale": k_global,

@@ -2796,12 +2796,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def _get_nvfp4_native_kv_pools(self) -> list:
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolFP4
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPoolFP4,
+        )
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = self.token_to_kv_pool
         if isinstance(pool, MHATokenToKVPoolFP4):
             return [pool]
+        if isinstance(pool, HybridLinearKVPool) and isinstance(
+            pool.full_kv_pool, MHATokenToKVPoolFP4
+        ):
+            return [pool.full_kv_pool]
         if (
             isinstance(pool, SWAKVPool)
             and isinstance(pool.full_kv_pool, MHATokenToKVPoolFP4)
