@@ -71,10 +71,12 @@ FetchContent_Declare(
 FetchContent_Populate(repo-triton)
 
 # flashinfer
+# Hijinks E3 shared FlashInfer fork: jethac/flashinfer@spark/hijinks-e3-flashinfer
+# 1eaa1aefc8d0a17bae5eb37eb9effff7a504fa0a
 FetchContent_Declare(
     repo-flashinfer
-    URL      https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
-    URL_HASH SHA256=931dfd118f4b6de8c7d98702153c7c03840139170af21a07607693bd9749744d
+    URL      https://${GITHUB_ARTIFACTORY}/jethac/flashinfer/archive/1eaa1aefc8d0a17bae5eb37eb9effff7a504fa0a.tar.gz
+    URL_HASH SHA256=dc50d3e88f48802222cb283b9f48cfea3ce46b70d085b092469c8b8f2cafbdfb
 )
 FetchContent_Populate(repo-flashinfer)
 
